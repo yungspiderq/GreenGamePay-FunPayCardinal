@@ -1,0 +1,410 @@
+import copy
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace as NS
+from unittest.mock import Mock
+
+import pytest
+import requests
+
+import greengamepay as g
+
+
+class FakeAPI:
+    def __init__(self):
+        self.calls = []
+        self.fail = None
+        self.cost = 1
+        self.overrides = {}
+
+    def call(self, endpoint, payload=None, **kwargs):
+        self.calls.append((endpoint, copy.deepcopy(payload)))
+        if endpoint == self.fail:
+            raise g.GGPError("Таймаут")
+        if endpoint in self.overrides:
+            return self.overrides[endpoint]
+        if endpoint == "check":
+            return {"result": True}
+        if endpoint in {"rates", "get_amount"}:
+            return {"usd_price": 2}
+        if endpoint == "create_order":
+            return {"custom_id": payload["custom_id"], "total": self.cost}
+        if endpoint == "steam_gift_create_order":
+            return {"custom_id": "777d8536-32ed-4fd4-a546-379ff97ec902", "total": self.cost}
+        if endpoint in {"pay_order", "steam_gift_pay_order"}:
+            return {"custom_id": payload["custom_id"], "msg": "Successfully paid the order"}
+        if endpoint in {"get_stars_price", "get_premium_price"}:
+            return {"ton": self.cost}
+        if endpoint == "steam_gift_calculate":
+            return {"price": self.cost}
+        if endpoint == "get_ton_balance":
+            return 20
+        if endpoint == "checkStarsRecipient":
+            return {"msg": "success", "min_stars": 50}
+        if endpoint in {"buyStars", "buyPremium"}:
+            return {"msg": "success", "username": payload["username"], "tx_id": "tx",
+                    "stars_amount": payload.get("quantity"), "period": payload.get("months")}
+        raise AssertionError(endpoint)
+
+
+@pytest.fixture
+def env(tmp_path):
+    category = NS(id=10)
+    lot = NS(id=123, description="Steam unique", subcategory=category, server=None, side=None)
+    order = NS(id="AB123", status=NS(name="PAID"), seller_id=1, buyer_id=2, chat_id=3,
+               buyer_username="buyer", short_description=lot.description, amount=1,
+               subcategory=category, server=None, side=None)
+    c = NS(plugins={g.UUID: NS(enabled=True)}, account=NS(id=1, get_order=Mock(return_value=order)),
+           telegram=NS(send_notification=Mock(), bot=NS(send_message=Mock(), delete_message=Mock()),
+                       authorized_users={7: {}}), old_mode_enabled=False, bl_delivery_enabled=True,
+           blacklist=[], send_message=Mock(return_value=True),
+           profile=NS(get_sorted_lots=Mock(return_value={123: lot})))
+    api = FakeAPI()
+    engine = g.Engine(c, tmp_path, api=api)
+    cfg = engine.config.snapshot()
+    cfg.update(enabled=True, dry_run=False)
+    cfg["lots"]["123"] = {"kind": "steam", "quantity": "1", "max_quantity": "1000", "max_cost": "10"}
+    engine.config.save(cfg)
+    event = NS(order=order, lot_id=123, lot_shortcut=lot, config_section_obj=None, delivered=False)
+    yield engine, event, c, api
+    engine.close()
+
+
+def prepare(env, kind="steam", quantity="1"):
+    engine, event, c, api = env
+    cfg = engine.config.snapshot()
+    cfg["lots"]["123"].update(kind=kind, quantity=quantity)
+    if kind == "gift":
+        cfg["lots"]["123"].update(sub_id=100, region="KZ")
+    engine.config.save(cfg)
+    engine.new_order(event)
+    value = {"steam": "test_login", "stars": "@testuser", "premium": "@testuser",
+             "gift": "https://s.team/p/abcd/efgh"}[kind]
+    engine.message(NS(text="!ggp AB123 " + value, author_id=2, chat_id=3))
+    row = engine.ledger.get("AB123")
+    assert row["state"] == "confirm"
+    return NS(text="!ggp AB123 да " + row["nonce"], author_id=2, chat_id=3)
+
+
+@pytest.mark.parametrize("kind,quantity,payment", [
+    ("steam", "1", "pay_order"), ("stars", "50", "buyStars"),
+    ("premium", "3", "buyPremium"), ("gift", "1", "steam_gift_pay_order")])
+def test_success_and_duplicate_events(env, kind, quantity, payment):
+    msg = prepare(env, kind, quantity)
+    engine, event, c, api = env
+    engine.message(msg)
+    engine.message(msg)
+    engine.new_order(event)
+    assert engine.ledger.get("AB123")["state"] == "done"
+    assert sum(endpoint == payment for endpoint, _ in api.calls) == 1
+
+
+def test_dry_run_never_contacts_provider(env):
+    msg = prepare(env)
+    engine, _, _, api = env
+    cfg = engine.config.snapshot()
+    cfg["dry_run"] = True
+    engine.config.save(cfg)
+    engine.message(msg)
+    assert not api.calls
+    assert engine.ledger.get("AB123")["state"] == "dry_run"
+
+
+@pytest.mark.parametrize("endpoint", ["create_order", "pay_order"])
+def test_ambiguous_request_never_retried(env, endpoint):
+    msg = prepare(env)
+    engine, event, _, api = env
+    api.fail = endpoint
+    engine.message(msg)
+    assert engine.ledger.get("AB123")["state"] == "review"
+    engine.message(msg)
+    engine.new_order(event)
+    admin(engine, "/ggp_resume AB123")
+    assert sum(name == endpoint for name, _ in api.calls) == 1
+
+
+def test_preflight_failure_can_resume(env):
+    msg = prepare(env)
+    engine, _, _, api = env
+    api.fail = "check"
+    engine.message(msg)
+    assert engine.ledger.get("AB123")["state"] == "blocked"
+    api.fail = None
+    admin(engine, "/ggp_resume AB123")
+    assert engine.ledger.get("AB123")["state"] == "done"
+
+
+def test_price_limit_stops_before_payment(env):
+    msg = prepare(env)
+    engine, _, _, api = env
+    api.cost = 11
+    engine.message(msg)
+    assert "pay_order" not in [name for name, _ in api.calls]
+    assert engine.ledger.get("AB123")["state"] == "review"
+
+
+@pytest.mark.parametrize("author,chat", [(5, 3), (2, 8), (0, 3), (1, 3)])
+def test_other_user_or_chat_cannot_confirm(env, author, chat):
+    msg = prepare(env)
+    msg.author_id, msg.chat_id = author, chat
+    env[0].message(msg)
+    assert not env[3].calls
+
+
+def test_confirmation_nonce_and_expiry(env):
+    msg = prepare(env)
+    engine = env[0]
+    wrong = copy.copy(msg)
+    wrong.text = "!ggp AB123 да 0000000"
+    engine.message(wrong)
+    assert not env[3].calls
+    row = engine.ledger.get("AB123")
+    row["confirm_until"] = time.time() - 1
+    engine.ledger.put(row)
+    engine.message(msg)
+    assert not env[3].calls
+    assert engine.ledger.get("AB123")["state"] == "waiting"
+
+
+def test_refund_before_confirmation(env):
+    msg = prepare(env)
+    env[1].order.status.name = "REFUNDED"
+    env[0].message(msg)
+    assert not env[3].calls
+
+
+def test_refund_between_create_and_pay(env):
+    msg = prepare(env)
+    original = env[3].call
+    def call(endpoint, payload=None, **kwargs):
+        result = original(endpoint, payload, **kwargs)
+        if endpoint == "create_order":
+            env[1].order.status.name = "REFUNDED"
+        return result
+    env[3].call = call
+    env[0].message(msg)
+    assert "pay_order" not in [name for name, _ in env[3].calls]
+    assert env[0].ledger.get("AB123")["state"] == "review"
+
+
+def test_disable_between_create_and_pay(env):
+    msg = prepare(env)
+    original = env[3].call
+    def call(endpoint, payload=None, **kwargs):
+        result = original(endpoint, payload, **kwargs)
+        if endpoint == "create_order":
+            env[2].plugins[g.UUID].enabled = False
+        return result
+    env[3].call = call
+    env[0].message(msg)
+    assert "pay_order" not in [name for name, _ in env[3].calls]
+
+
+def test_failed_chat_delivery_can_resend_without_buying(env):
+    msg = prepare(env)
+    engine, _, c, api = env
+    c.send_message.return_value = False
+    engine.message(msg)
+    assert engine.ledger.get("AB123")["state"] == "paid"
+    count = len(api.calls)
+    c.send_message.return_value = True
+    admin(engine, "/ggp_redeliver AB123")
+    assert len(api.calls) == count
+    assert engine.ledger.get("AB123")["state"] == "done"
+
+
+@pytest.mark.parametrize("state", ["creating", "paying"])
+def test_restart_quarantines_in_flight(env, state):
+    prepare(env)
+    engine = env[0]
+    row = engine.ledger.get("AB123")
+    engine.phase(row, state)
+    g.Ledger(engine.config.path.parent).recover()
+    assert engine.ledger.get("AB123")["state"] == "review"
+
+
+def test_second_instance_is_rejected(env):
+    with pytest.raises(g.GGPError):
+        g.InstanceLock(env[0].config.path.parent)
+
+
+def test_ledger_atomic_duplicate_insert(tmp_path):
+    ledger = g.Ledger(tmp_path)
+    row = {"id": "X", "state": "waiting"}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(lambda _: ledger.add(row), range(20)))
+    assert sum(results) == 1
+
+
+@pytest.mark.parametrize("change", ["title", "buyer", "seller", "category", "duplicate", "native", "old_mode", "blacklist"])
+def test_wrong_or_ambiguous_order_is_not_purchased(env, change):
+    engine, event, c, api = env
+    if change == "title":
+        event.order.short_description = "forged title"
+    elif change == "buyer":
+        event.order = copy.copy(event.order)
+        event.order.buyer_id = 99
+    elif change == "seller":
+        event.order.seller_id = 99
+    elif change == "category":
+        event.order.subcategory = NS(id=99)
+    elif change == "duplicate":
+        twin = copy.copy(event.lot_shortcut)
+        twin.id = 124
+        c.profile.get_sorted_lots.return_value[124] = twin
+    elif change == "native":
+        event.delivered = True
+    elif change == "old_mode":
+        c.old_mode_enabled = True
+    elif change == "blacklist":
+        c.blacklist.append("buyer")
+    engine.new_order(event)
+    assert engine.ledger.get("AB123") is None
+    assert not api.calls
+
+
+@pytest.mark.parametrize("currency,endpoint", [("RUB", "get_amount"), ("UAH", "rates"), ("KZT", "rates")])
+def test_currency_conversion_and_units(env, currency, endpoint):
+    engine, event, _, api = env
+    event.order.amount = 2
+    cfg = engine.config.snapshot()
+    cfg["lots"]["123"].update(currency=currency, quantity="100")
+    engine.config.save(cfg)
+    engine.new_order(event)
+    engine.message(NS(text="!ggp AB123 test_login", author_id=2, chat_id=3))
+    nonce = engine.ledger.get("AB123")["nonce"]
+    engine.message(NS(text="!ggp AB123 да " + nonce, author_id=2, chat_id=3))
+    assert dict(api.calls)[endpoint]["amount"] == 200
+    assert dict(api.calls)["create_order"]["quantity"] == 2
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-1", "0", "bad", None])
+def test_invalid_numbers(bad):
+    with pytest.raises(g.GGPError):
+        g.number(bad)
+
+
+@pytest.mark.parametrize("kind,value", [("steam", "https://steamcommunity.com/id/x"),
+    ("stars", "@bad user"), ("gift", "https://s.team.evil.test/p/x"),
+    ("gift", "https://evil@s.team/p/x"), ("gift", "http://s.team/p/x")])
+def test_invalid_recipients(kind, value):
+    with pytest.raises(g.GGPError):
+        g.recipient(kind, value)
+
+
+def admin(engine, text, user=7, chat_type="private"):
+    message = NS(text=text, from_user=NS(id=user), chat=NS(id=user, type=chat_type), id=1)
+    g.telegram_command(engine, message)
+
+
+@pytest.mark.parametrize("user,chat_type", [(8, "private"), (7, "group")])
+def test_telegram_access_control(env, user, chat_type):
+    engine = env[0]
+    before = engine.config.snapshot()
+    admin(engine, "/ggp_off", user, chat_type)
+    assert engine.config.snapshot() == before
+
+
+def test_config_corruption_is_not_silently_reset(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text("BROKEN", encoding="utf8")
+    with pytest.raises(ValueError):
+        g.Config(tmp_path)
+    assert path.read_text() == "BROKEN"
+
+
+def test_http_token_cache_and_no_retry(tmp_path):
+    cfg = g.Config(tmp_path)
+    data = cfg.snapshot()
+    data.update(username="user", password="secret")
+    cfg.save(data)
+    session = Mock()
+    token = Mock(status_code=200)
+    token.json.return_value = {"access_token": "hidden-token", "expired": time.time() + 3600}
+    ok = Mock(status_code=200)
+    ok.json.return_value = 50
+    denied = Mock(status_code=403)
+    denied.json.return_value = {"detail": "hidden-token secret"}
+    session.request.side_effect = [token, ok, denied]
+    api = g.API(cfg, session)
+    assert api.call("check_balance") == 50
+    with pytest.raises(g.GGPError) as error:
+        api.call("pay_order", {"custom_id": "id"})
+    assert "secret" not in str(error.value) and "hidden-token" not in str(error.value)
+    assert session.request.call_count == 3
+    assert api.token is None
+    for call in session.request.call_args_list:
+        assert call.kwargs["allow_redirects"] is False
+        assert call.kwargs["timeout"] == (10, 60)
+
+
+@pytest.mark.parametrize("failure", [requests.Timeout("secret"), "bad_json", "body_error", "redirect"])
+def test_http_protocol_errors_are_safe(tmp_path, failure):
+    api = g.API(g.Config(tmp_path), Mock())
+    response = Mock(status_code=200)
+    if isinstance(failure, Exception):
+        api.session.request.side_effect = failure
+    else:
+        api.session.request.return_value = response
+        if failure == "bad_json":
+            response.json.side_effect = ValueError("secret")
+        elif failure == "body_error":
+            response.json.return_value = {"detail": "secret"}
+        else:
+            response.status_code = 302
+    with pytest.raises(g.GGPError) as error:
+        api._request("test")
+    assert "secret" not in str(error.value)
+    assert api.session.request.call_count == 1
+
+
+def test_unknown_premium_quote_stops_safely(env):
+    msg = prepare(env, "premium", "3")
+    env[3].overrides["get_premium_price"] = {"unknown": 1}
+    env[0].message(msg)
+    assert "buyPremium" not in [name for name, _ in env[3].calls]
+    assert env[0].ledger.get("AB123")["state"] == "blocked"
+
+
+def test_unconfirmed_success_body_is_reviewed(env):
+    msg = prepare(env)
+    env[3].overrides["pay_order"] = {"msg": "queued"}
+    env[0].message(msg)
+    assert env[0].ledger.get("AB123")["state"] == "review"
+
+
+def test_worker_serializes_repeated_confirmation(env):
+    msg = prepare(env)
+    engine = env[0]
+    done = threading.Event()
+    for _ in range(10):
+        engine.submit(engine.message, msg)
+    engine.submit(done.set)
+    assert done.wait(10)
+    assert sum(name == "pay_order" for name, _ in env[3].calls) == 1
+
+
+def test_rule_snapshot_survives_config_change(env):
+    msg = prepare(env)
+    cfg = env[0].config.snapshot()
+    cfg["lots"]["123"]["quantity"] = "100"
+    env[0].config.save(cfg)
+    env[0].message(msg)
+    assert dict(env[3].calls)["create_order"]["quantity"] == 1
+
+
+def test_metadata_and_hooks():
+    import uuid
+    assert uuid.UUID(g.UUID).version == 4
+    for field in ["NAME", "VERSION", "DESCRIPTION", "CREDITS", "SETTINGS_PAGE", "UUID", "BIND_TO_DELETE"]:
+        assert hasattr(g, field)
+    assert g.BIND_TO_NEW_ORDER == [g.new_order]
+    assert callable(g.BIND_TO_DELETE)
+
+
+def test_json_contains_no_auth_in_order(env):
+    prepare(env)
+    row = json.dumps(env[0].ledger.get("AB123"))
+    assert "password" not in row and "access_token" not in row
