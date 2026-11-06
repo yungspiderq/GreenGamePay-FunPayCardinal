@@ -61,6 +61,9 @@ def env(tmp_path):
                        authorized_users={7: {}}), old_mode_enabled=False, bl_delivery_enabled=True,
            blacklist=[], send_message=Mock(return_value=True),
            profile=NS(get_sorted_lots=Mock(return_value={123: lot})))
+    c.profile.id = c.account.id
+    c.profile.update_lot = lambda item: c.profile.get_sorted_lots.return_value.update({item.id: item})
+    c.account.get_user = Mock(return_value=c.profile)
     api = FakeAPI()
     engine = g.Engine(c, tmp_path, api=api)
     cfg = engine.config.snapshot()
@@ -1159,3 +1162,161 @@ def test_guard_recovery_notification_is_not_repeated_for_varying_balances(guard_
         engine.balance_guard.check()
     notices = [str(call) for call in c.telegram.send_notification.call_args_list]
     assert sum("выше порога" in text for text in notices) == 1
+
+
+def remote_profile(c, lots):
+    return NS(id=c.account.id, get_sorted_lots=Mock(return_value=dict(lots)))
+
+
+def test_new_funpay_lot_is_found_configured_and_processed_without_restart(ui, env):
+    engine, event, c, api = env
+    ui.click("lots:0")
+    old_lot = event.lot_shortcut
+    new_lot = copy.copy(old_lot)
+    new_lot.id, new_lot.description = 456, "Brand new Steam lot"
+    c.account.get_user.return_value = remote_profile(c, {123: old_lot, 456: new_lot})
+    assert 456 not in c.profile.get_sorted_lots(1)
+    ui.click("lotsrefresh")
+    ui.click("lot:456")
+    ui.click("setup:456")
+    ui.click("kind:steam")
+    ui.click("currency:USD")
+    for value in ["1", "10", "10"]:
+        ui.type(value)
+    ui.click("save")
+    assert "456" in engine.config.snapshot()["lots"]
+    assert c.profile.get_sorted_lots(1)[456] is new_lot
+    order = copy.copy(event.order)
+    order.id, order.short_description = "AB456", new_lot.description
+    c.account.get_order.return_value = order
+    new_event = NS(order=order, lot_id=456, lot_shortcut=new_lot, delivered=False, config_section_obj=None)
+    engine.new_order(new_event)
+    engine.message(NS(text="!ggp AB456 test_login", author_id=2, chat_id=3))
+    nonce = engine.ledger.get("AB456")["nonce"]
+    engine.message(NS(text="!ggp AB456 да " + nonce, author_id=2, chat_id=3))
+    assert engine.ledger.get("AB456")["state"] == "done"
+    assert sum(name == "pay_order" for name, _ in api.calls) == 1
+
+
+def test_lot_menu_automatically_refreshes_each_time_it_is_opened(ui, env):
+    c = env[2]
+    ui.click("lots:0")
+    ui.click("home")
+    new_lot = copy.copy(env[1].lot_shortcut)
+    new_lot.id = 456
+    c.account.get_user.return_value = remote_profile(c, {456: new_lot})
+    before = c.account.get_user.call_count
+    ui.click("lots:0")
+    assert c.account.get_user.call_count == before + 1
+    assert any(button.callback_data.endswith("lot:456") for button in ui.buttons)
+
+
+def test_refresh_failure_keeps_previous_list_and_rules(ui, env):
+    ui.click("lots:0")
+    before = ui.engine.config.snapshot()
+    env[2].account.get_user.side_effect = RuntimeError("private-cookie")
+    ui.click("lotsrefresh")
+    assert "Сохранён предыдущий список" in ui.text
+    assert "private-cookie" not in ui.text
+    assert any(button.callback_data.endswith("lot:123") for button in ui.buttons)
+    assert ui.engine.config.snapshot() == before
+
+
+def test_refresh_preserves_inactive_cardinal_history(env):
+    engine, event, c, _ = env
+    inactive = copy.copy(event.lot_shortcut)
+    inactive.id = 999
+    c.profile.get_sorted_lots.return_value[999] = inactive
+    c.account.get_user.return_value = remote_profile(c, {123: event.lot_shortcut})
+    assert 999 not in engine.refresh_lots(force=True)
+    assert 999 in c.profile.get_sorted_lots(1)
+
+
+def test_missing_configured_lot_is_not_called_deleted(ui, env):
+    env[2].account.get_user.return_value = remote_profile(env[2], {})
+    ui.click("lots:0")
+    assert any("Не виден" in button.text for button in ui.buttons)
+    ui.click("lot:123")
+    assert "выключен, удалён или ещё не опубликован" in ui.text
+
+
+def test_lot_disappears_during_wizard_without_overwriting_rule(ui, env):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("setup:123")
+    ui.click("kind:stars")
+    for value in ["50", "100", "10"]:
+        ui.type(value)
+    before = ui.engine.config.snapshot()
+    env[2].account.get_user.return_value = remote_profile(env[2], {})
+    ui.click("save")
+    assert "не виден" in ui.text
+    assert ui.engine.config.snapshot() == before
+
+
+def test_refresh_cache_for_pagination_and_force_button(env, monkeypatch):
+    engine, _, c, _ = env
+    now = [100.0]
+    monkeypatch.setattr(g.time, "monotonic", lambda: now[0])
+    engine.refresh_lots()
+    engine.refresh_lots()
+    assert c.account.get_user.call_count == 1
+    engine.refresh_lots(force=True)
+    assert c.account.get_user.call_count == 2
+    now[0] += 31
+    engine.refresh_lots()
+    assert c.account.get_user.call_count == 3
+
+
+def test_wrong_owner_refresh_cannot_replace_inventory(env):
+    engine, _, c, _ = env
+    original = engine.refresh_lots()
+    c.account.get_user.return_value = NS(id=99, get_sorted_lots=Mock(return_value={}))
+    with pytest.raises(g.GGPError):
+        engine.refresh_lots(force=True)
+    assert engine.current_lots() == original
+
+
+def test_command_bind_finds_new_lot_from_funpay(env):
+    engine, event, c, _ = env
+    new_lot = copy.copy(event.lot_shortcut)
+    new_lot.id = 456
+    c.account.get_user.return_value = remote_profile(c, {456: new_lot})
+    admin(engine, '/ggp_bind 456 {"kind":"steam","quantity":"1","max_quantity":"10","max_cost":"10"}')
+    assert "456" in engine.config.snapshot()["lots"]
+
+
+def test_command_lots_fetches_server_instead_of_startup_profile(env):
+    engine, event, c, _ = env
+    new_lot = copy.copy(event.lot_shortcut)
+    new_lot.id, new_lot.description = 456, "Newly published"
+    c.account.get_user.return_value = remote_profile(c, {456: new_lot})
+    admin(engine, "/ggp_lots")
+    assert "456: Newly published" in c.telegram.bot.send_message.call_args.args[1]
+
+
+def test_readiness_uses_fresh_funpay_snapshot(ui, env):
+    env[2].account.get_user.return_value = remote_profile(env[2], {})
+    ui.click("diagnostics")
+    assert "#123: лот не найден" in ui.text
+
+
+def test_ledger_connections_are_closed_even_after_failure(tmp_path, monkeypatch):
+    opened = []
+    original = g.sqlite3.connect
+    def connect(*args, **kwargs):
+        db = original(*args, **kwargs)
+        opened.append(db)
+        return db
+    monkeypatch.setattr(g.sqlite3, "connect", connect)
+    ledger = g.Ledger(tmp_path)
+    ledger.add({"id": "A", "state": "waiting"})
+    ledger.get("A")
+    with pytest.raises(RuntimeError):
+        with ledger.connect() as db:
+            db.execute("DELETE FROM orders")
+            raise RuntimeError("rollback")
+    assert ledger.get("A") is not None
+    for db in opened:
+        with pytest.raises(g.sqlite3.ProgrammingError):
+            db.execute("SELECT 1")

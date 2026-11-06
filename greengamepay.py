@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,7 +21,7 @@ from urllib.parse import urlparse
 import requests
 
 NAME = "GreenGamePay"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DESCRIPTION = "Steam, Telegram Stars/Premium и подарки Steam через GreenGamePay. /ggp"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "e375b82f-b750-4dbe-bbc0-9731c39acf0a"
@@ -175,10 +176,15 @@ class Ledger:
         except OSError:
             pass
 
+    @contextmanager
     def connect(self):
         db = sqlite3.connect(str(self.path), timeout=30)
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.execute("PRAGMA synchronous=FULL")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def add(self, row):
         with self.connect() as db:
@@ -548,11 +554,46 @@ class Engine:
         self.paused = threading.Event()
         self.panel = Panel(self)
         self.balance_guard = BalanceGuard(self)
+        self.lot_cache = None
+        self.lot_cache_time = 0.0
 
     def active(self):
         plugin = self.c.plugins.get(UUID)
         return (not self.stopped and not self.paused.is_set() and bool(plugin and plugin.enabled)
                 and self.config.snapshot()["enabled"])
+
+    def current_lots(self):
+        if self.lot_cache is not None:
+            return dict(self.lot_cache)
+        return dict(self.c.profile.get_sorted_lots(1)) if self.c.profile else {}
+
+    def refresh_lots(self, force=False):
+        if not force and self.lot_cache is not None and time.monotonic() - self.lot_cache_time < 30:
+            return self.current_lots()
+        try:
+            fresh = self.c.account.get_user(self.c.account.id)
+            if fresh.id != self.c.account.id:
+                raise GGPError("Получен профиль другого пользователя.")
+            lots = fresh.get_sorted_lots(1)
+            if not isinstance(lots, dict) or any(str(key) != str(lot.id) for key, lot in lots.items()):
+                raise GGPError("Некорректный список лотов FunPay.")
+            snapshot = dict(lots)
+            if self.c.profile is None:
+                raise GGPError("Cardinal ещё загружает профиль.")
+            # Cardinal retains inactive offers for auto-restore. Merge current offers instead of replacing it.
+            for lot in snapshot.values():
+                self.c.profile.update_lot(lot)
+        except Exception:
+            raise GGPError("Не удалось обновить лоты с FunPay. Сохранён предыдущий список; попробуйте обновить ещё раз.") from None
+        self.lot_cache = snapshot
+        self.lot_cache_time = time.monotonic()
+        return self.current_lots()
+
+    def require_current_lot(self, lot_id):
+        lot = self.refresh_lots(force=True).get(int(lot_id))
+        if lot is None:
+            raise GGPError("Лот сейчас не виден в профиле FunPay. Проверьте, что он опубликован и активен, затем обновите список.")
+        return lot
 
     def close(self):
         self.stopped = True
@@ -871,9 +912,7 @@ def telegram_command(engine, message):
                 lot_id, _, body = argument.partition(" ")
                 integer(lot_id, "LOT_ID")
                 rule = validate_rule(json.loads(body))
-                lots = c.profile.get_sorted_lots(1)
-                if int(lot_id) not in lots:
-                    raise GGPError("Лот не найден в профиле продавца. Проверьте /ggp_lots.")
+                engine.require_current_lot(lot_id)
                 cfg["lots"][str(int(lot_id))] = rule
                 engine.config.save(cfg)
                 reply("Привязка сохранена. Отключите стандартную автовыдачу для этого лота. /ggp_rules")
@@ -884,7 +923,7 @@ def telegram_command(engine, message):
             elif command == "/ggp_rules":
                 reply(json.dumps(cfg["lots"], ensure_ascii=False, indent=2))
             elif command == "/ggp_lots":
-                reply("\n".join(f"{key}: {lot.description}" for key, lot in c.profile.get_sorted_lots(1).items()) or "Лотов нет.")
+                reply("\n".join(f"{key}: {lot.description}" for key, lot in engine.refresh_lots(force=True).items()) or "Лотов нет.")
             elif command == "/ggp_balance":
                 reply("USD: " + str(engine.api.call("check_balance")) + "\nTON: " + str(engine.api.call("get_ton_balance")))
             elif command == "/ggp_services":
@@ -1048,10 +1087,15 @@ class Panel:
         if authorized(self.e.c, message):
             self.home(self.context(message))
 
-    def lots(self, ctx, page=0):
+    def lots(self, ctx, page=0, force=False):
         self.clear(ctx)
         cfg = self.e.config.snapshot()
-        items = list(self.e.c.profile.get_sorted_lots(1).items())
+        note = "✅ Список получен с FunPay."
+        try:
+            items = list(self.e.refresh_lots(force=force or page == 0).items())
+        except GGPError as exc:
+            items = list(self.e.current_lots().items())
+            note = "⚠️ " + str(exc)
         # Include removed lots so stale rules can still be inspected and unbound.
         known = {str(key) for key, _ in items}
         items += [(int(key), None) for key in cfg["lots"] if key not in known]
@@ -1060,13 +1104,14 @@ class Panel:
         for lot_id, lot in items[page * 6:page * 6 + 6]:
             rule = cfg["lots"].get(str(lot_id))
             label = ("⏸ " if rule and not rule.get("enabled", True) else "✅ " if rule else "⬜ ") + f"#{lot_id} · "
-            label += (lot.description or "Без названия")[:34] if lot else "Лот удалён с FunPay"
+            label += (lot.description or "Без названия")[:34] if lot else "Не виден в профиле FunPay"
             rows.append([(label, f"lot:{lot_id}")])
         self.pager(rows, "lots", page, len(items), 6)
+        rows.append([("🔄 Обновить лоты с FunPay", "lotsrefresh")])
         rows.append([("⬅️ В главное меню", "home")])
         self.show(ctx, "📦 Мои лоты\n\nВыберите лот для настройки.\n✅ — настроен; ⏸ — пауза; ⬜ — не настроен.\n"
-                  "Настройки применяются только к новым заказам.\n\n"
-                  + (f"Страница {page + 1}" if items else "Лотов пока нет. Добавьте лот на FunPay и обновите профиль Cardinal."), rows)
+                  "Настройки применяются только к новым заказам.\n\n" + note + "\n\n"
+                  + (f"Страница {page + 1}" if items else "Активных лотов пока нет. Опубликуйте лот на FunPay и нажмите «Обновить лоты с FunPay»."), rows)
 
     @staticmethod
     def pager(rows, name, page, count, size):
@@ -1081,8 +1126,8 @@ class Panel:
     def lot(self, ctx, lot_id):
         self.clear(ctx)
         rule = self.e.config.snapshot()["lots"].get(lot_id)
-        lot = self.e.c.profile.get_sorted_lots(1).get(int(lot_id))
-        text = f"📦 Лот #{lot_id}\n\n" + ((lot.description or "Без названия")[:700] if lot else "Лот больше не найден на FunPay.")
+        lot = self.e.current_lots().get(int(lot_id))
+        text = f"📦 Лот #{lot_id}\n\n" + ((lot.description or "Без названия")[:700] if lot else "Лот не виден в профиле FunPay: он может быть выключен, удалён или ещё не опубликован.")
         text += "\n\n" + (rule_text(rule) if rule else "Этот лот пока не подключён к GreenGamePay.")
         if rule and not rule.get("enabled", True):
             text += "\n\n⏸ Новые заказы этого лота не обрабатываются. Уже принятые продолжают выполняться."
@@ -1295,8 +1340,7 @@ class Panel:
             self.next_step(ctx, "max_cost")
         elif action == "save":
             cfg = self.e.config.snapshot()
-            if int(data["lot_id"]) not in self.e.c.profile.get_sorted_lots(1):
-                raise GGPError("Лот больше не найден на FunPay. Обновите профиль Cardinal.")
+            self.e.require_current_lot(data["lot_id"])
             cfg["lots"][data["lot_id"]] = validate_rule(rule)
             self.e.config.save(cfg)
             self.lot(ctx, data["lot_id"])
@@ -1325,7 +1369,7 @@ class Panel:
                  ("✅ Данные GreenGamePay указаны" if credentials else "⚠️ Введите данные GreenGamePay в «Подключении»"),
                  ("🧪 Сейчас тестовый режим, покупок не будет" if cfg["dry_run"] else "💳 Сейчас режим реальных покупок"),
                  ("🟢 Автопокупка включена" if self.e.active() else "⏸ Автопокупка остановлена")]
-        lots = c.profile.get_sorted_lots(1)
+        lots = self.e.refresh_lots(force=True)
         enabled = {key: rule for key, rule in cfg["lots"].items() if rule.get("enabled", True)}
         issues = []
         if not enabled:
@@ -1587,12 +1631,13 @@ class Panel:
                       [[("🔄 Обновить баланс", "balance")], [("⬅️ В главное меню", "home")]])
         elif action == "lots":
             self.lots(ctx, int(arg))
+        elif action == "lotsrefresh":
+            self.lots(ctx, force=True)
         elif action == "lot":
             self.lot(ctx, str(integer(arg, "ID лота")))
         elif action == "setup":
             lot_id = str(integer(arg, "ID лота"))
-            if int(lot_id) not in self.e.c.profile.get_sorted_lots(1):
-                raise GGPError("Лот не найден. Обновите профиль Cardinal.")
+            self.e.require_current_lot(lot_id)
             self.begin(ctx, "kind", lot_id=lot_id,
                        rule={"enabled": cfg["lots"].get(lot_id, {}).get("enabled", True)})
         elif action in {"kind", "currency", "months", "region", "save"}:
