@@ -649,3 +649,174 @@ def test_panel_environment_credentials_are_not_overwritten_by_wizard(ui, monkeyp
     ui.click("connect")
     assert "переменные окружения" in ui.text
     assert not any(button.callback_data.endswith(":auth") for button in ui.buttons)
+
+
+def test_steam_settings_explain_100_rubles(ui):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("setup:123")
+    ui.click("kind:steam")
+    ui.click("currency:RUB")
+    assert "100 RUB" in ui.text and "200 RUB" in ui.text
+    assert "Цену продажи" in ui.text
+
+
+def test_calculator_matches_real_order_quantity_without_api(ui, env):
+    cfg = ui.engine.config.snapshot()
+    cfg["lots"]["123"].update(quantity="100", currency="RUB", max_quantity="500")
+    ui.engine.config.save(cfg)
+    ui.click("lots:0")
+    ui.click("lot:123")
+    assert "Сумма пополнения за 1 штуку лота: 100 RUB" in ui.text
+    ui.click("calculate:123")
+    ui.type("2")
+    assert "Итого получит: 200 RUB" in ui.text
+    assert not env[3].calls
+    assert not ui.engine.ledger.recent()
+    assert ui.engine.config.snapshot() == cfg
+
+
+@pytest.mark.parametrize("kind,quantity,units", [("steam", "100", "6"), ("stars", "50", "11"),
+    ("premium", "3", "2"), ("gift", "1", "2")])
+def test_calculator_rejects_limits_and_subscription_multiples(ui, kind, quantity, units):
+    cfg = ui.engine.config.snapshot()
+    rule = dict(kind=kind, quantity=quantity, max_quantity="500", max_cost="10")
+    if kind == "gift":
+        rule.update(sub_id=123, region="KZ")
+    cfg["lots"]["123"] = rule
+    ui.engine.config.save(cfg)
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("calculate:123")
+    ui.type(units)
+    assert "⚠️" in ui.text
+    assert (7, 7) in ui.panel.pending  # corrected input is still accepted
+    ui.type("1")
+    assert "Итого получит:" in ui.text
+
+
+def test_pause_skips_new_orders_without_deleting_configuration(ui, env):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("lotpause:123")
+    assert ui.engine.config.snapshot()["lots"]["123"]["enabled"] is False
+    env[0].new_order(env[1])
+    assert not env[0].ledger.get("AB123")
+    assert not env[3].calls
+    ui.click("lotresume:123")
+    env[0].new_order(env[1])
+    assert env[0].ledger.get("AB123")["state"] == "waiting"
+
+
+def test_pausing_lot_keeps_accepted_order_running(ui, env):
+    msg = prepare(env)
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("lotpause:123")
+    env[0].message(msg)
+    assert env[0].ledger.get("AB123")["state"] == "done"
+
+
+def test_editing_paused_lot_does_not_resume_it(ui):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("lotpause:123")
+    ui.click("setup:123")
+    ui.click("kind:stars")
+    for value in ["50", "100", "5"]:
+        ui.type(value)
+    ui.click("save")
+    assert ui.engine.config.snapshot()["lots"]["123"]["enabled"] is False
+
+
+def test_invalid_lot_enabled_flag_is_rejected():
+    with pytest.raises(g.GGPError):
+        g.validate_rule(dict(kind="steam", quantity="1", max_quantity="5", max_cost="10", enabled="false"))
+
+
+def test_find_order_accepts_lowercase_and_hash(ui, env):
+    prepare(env)
+    ui.click("orders:0")
+    ui.click("findorder")
+    ui.type("#ab123")
+    assert "Заказ #AB123" in ui.text
+    assert not ui.panel.pending
+
+
+def test_find_missing_order_can_be_corrected(ui, env):
+    prepare(env)
+    ui.click("orders:0")
+    ui.click("findorder")
+    ui.type("MISSING")
+    assert "не найден" in ui.text
+    ui.type("AB123")
+    assert "Заказ #AB123" in ui.text
+
+
+def test_summary_counts_all_records_and_separates_manual_and_tests(tmp_path):
+    ledger = g.Ledger(tmp_path)
+    now = time.time()
+    rows = [("done", False), ("done", True), ("paid", False), ("dry_run", False),
+            ("cancelled", False), ("confirm", False), ("review", False), ("paying", False)]
+    for i, (state, manual) in enumerate(rows):
+        ledger.add(dict(id=str(i), state=state, manual_resolution=manual, created=now - i * 20000))
+    # Beyond the 100-entry panel window: the summary must still count all history.
+    for i in range(105):
+        ledger.add(dict(id="old" + str(i), state="done", created=now - 200000))
+    data = ledger.summary(now)
+    assert data == dict(total=113, last24=5, waiting=1, attention=1, paid=107,
+                        manual=1, dry_run=1, cancelled=1, processing=1)
+
+
+def test_summary_screen(ui, env):
+    prepare(env)
+    ui.click("summary")
+    assert "Всего в журнале: 1" in ui.text
+    assert "Ждём покупателя: 1" in ui.text
+    assert not env[3].calls
+
+
+def test_readiness_finds_conflicts_without_provider_calls(ui, env):
+    import configparser
+    c = env[2]
+    c.old_mode_enabled = True
+    c.AD_CFG = configparser.ConfigParser()
+    c.AD_CFG["Steam unique"] = {"disable": "0"}
+    lot = env[1].lot_shortcut
+    lot.auto = True
+    twin = copy.copy(lot)
+    twin.id = 124
+    c.profile.get_sorted_lots.return_value[124] = twin
+    ui.click("diagnostics")
+    assert "Отключите старый режим" in ui.text
+    assert "совпадающие названия" in ui.text
+    assert "автовыдачу самого FunPay" in ui.text
+    assert "стандартную автовыдачу Cardinal" in ui.text
+    assert not env[3].calls
+
+
+def test_readiness_uses_most_specific_cardinal_rule(ui, env):
+    import configparser
+    c = env[2]
+    c.AD_CFG = configparser.ConfigParser()
+    c.AD_CFG["Steam"] = {"disable": "0"}
+    c.AD_CFG["Steam unique"] = {"disable": "1"}
+    ui.click("diagnostics")
+    assert "Конфликтов лотов" in ui.text
+    assert "отключите стандартную автовыдачу" not in ui.text
+
+
+def test_readiness_reports_missing_lot(ui, env):
+    env[2].profile.get_sorted_lots.return_value.clear()
+    ui.click("diagnostics")
+    assert "#123: лот не найден" in ui.text
+
+
+@pytest.mark.parametrize("auto,secrets", [(True, []), (False, ["already-delivered-code"])])
+def test_funpay_native_delivery_cannot_trigger_second_purchase(env, auto, secrets):
+    engine, event, _, api = env
+    event.lot_shortcut.auto = auto
+    event.order.order_secrets = secrets
+    engine.new_order(event)
+    assert engine.ledger.get("AB123") is None
+    assert not api.calls

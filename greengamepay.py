@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import requests
 
 NAME = "GreenGamePay"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = "Steam, Telegram Stars/Premium и подарки Steam через GreenGamePay. /ggp"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "e375b82f-b750-4dbe-bbc0-9731c39acf0a"
@@ -58,6 +58,8 @@ def validate_rule(rule):
     if not isinstance(rule, dict) or rule.get("kind") not in KINDS:
         raise GGPError("kind: steam, stars, premium или gift.")
     result = copy.deepcopy(rule)
+    if type(result.get("enabled", True)) is not bool:
+        raise GGPError("enabled для лота должно быть true/false.")
     kind = result["kind"]
     result["quantity"] = str(number(result.get("quantity", 1), "quantity"))
     result["max_quantity"] = str(number(result.get("max_quantity"), "max_quantity"))
@@ -79,6 +81,17 @@ def validate_rule(rule):
     if number(result["quantity"]) > number(result["max_quantity"]):
         raise GGPError("quantity превышает max_quantity.")
     return result
+
+
+def order_quantity(rule, units):
+    """Shared by the preview calculator and real order processing."""
+    units = integer(units, "число штук лота")
+    if rule["kind"] in {"premium", "gift"} and units != 1:
+        raise GGPError("Для подписки Premium или подарка Steam покупайте по одной штуке за заказ.")
+    quantity = number(rule["quantity"]) * units
+    if quantity > number(rule["max_quantity"]):
+        raise GGPError("Объём покупки превышает настроенный максимум одного заказа.")
+    return quantity
 
 
 def recipient(kind, text):
@@ -180,6 +193,28 @@ class Ledger:
         with self.connect() as db:
             rows = db.execute("SELECT body FROM orders ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def summary(self, now=None):
+        cutoff = (time.time() if now is None else now) - 86400
+        result = {"total": 0, "last24": 0, "waiting": 0, "attention": 0, "paid": 0,
+                  "manual": 0, "dry_run": 0, "cancelled": 0, "processing": 0}
+        with self.connect() as db:
+            for body, in db.execute("SELECT body FROM orders"):
+                row = json.loads(body)
+                result["total"] += 1
+                result["last24"] += row.get("created", 0) >= cutoff
+                state = row["state"]
+                if state in {"waiting", "confirm"}:
+                    result["waiting"] += 1
+                elif state in {"blocked", "review", "created", "ready"}:
+                    result["attention"] += 1
+                elif state in {"paid", "done"}:
+                    result["manual" if row.get("manual_resolution") else "paid"] += 1
+                elif state in {"dry_run", "cancelled"}:
+                    result[state] += 1
+                else:
+                    result["processing"] += 1
+        return result
 
     def recover(self):
         with self.connect() as db:
@@ -353,7 +388,7 @@ class Engine:
         lot_id = str(getattr(event, "lot_id", ""))
         rule = self.config.snapshot()["lots"].get(lot_id)
         lot = getattr(event, "lot_shortcut", None)
-        if not rule or not lot:
+        if not rule or not lot or not rule.get("enabled", True):
             return
         # Native delivery runs before plugin NEW_ORDER handlers; never buy twice.
         native = getattr(event, "config_section_obj", None)
@@ -362,6 +397,8 @@ class Engine:
             return
         try:
             order = self.c.account.get_order(shortcut.id)
+            if getattr(lot, "auto", False) or getattr(order, "order_secrets", None):
+                raise GGPError("У лота включена выдача самого FunPay. Отключите её перед подключением GreenGamePay.")
             # Cardinal's lot_id is inferred from text; verify against seller-authored full order fields.
             if (order.short_description != lot.description or order.buyer_id != shortcut.buyer_id
                     or order.seller_id != self.c.account.id or getattr(order.status, "name", "") != "PAID"
@@ -376,11 +413,7 @@ class Engine:
                 raise GGPError("Неоднозначный лот. Сделайте названия лотов уникальными в категории/сервере.")
             units = integer(order.amount, "количество FunPay")
             rule = validate_rule(rule)
-            if rule["kind"] in {"premium", "gift"} and units != 1:
-                raise GGPError("Premium и gift: покупайте по одной единице лота за заказ.")
-            quantity = number(rule["quantity"]) * units
-            if quantity > number(rule["max_quantity"]):
-                raise GGPError("Количество превышает max_quantity лота.")
+            quantity = order_quantity(rule, units)
             row = {"id": order.id, "state": "waiting", "lot_id": lot_id, "rule": rule,
                    "quantity": str(quantity), "units": units, "description": order.short_description,
                    "buyer_id": order.buyer_id, "buyer_name": order.buyer_username,
@@ -424,7 +457,8 @@ class Engine:
                 value = recipient(row["rule"]["kind"], parts[2])
                 nonce = secrets.token_hex(3)
                 self.phase(row, "confirm", recipient=value, nonce=nonce, confirm_until=time.time() + 900)
-                self.tell(row, f"Заказ #{row['id']}: {KIND_NAMES[row['rule']['kind']]}, объём {row['quantity']}, "
+                self.tell(row, f"Заказ #{row['id']}: {KIND_NAMES[row['rule']['kind']]}, "
+                          f"получите {row['quantity']} {quantity_unit(row['rule'])}, "
                           f"получатель: {value}.\nПодтвердите в течение 15 минут:\n!ggp {row['id']} да {nonce}\n"
                           "Для исправления отправьте команду с новым получателем.")
         except GGPError as exc:
@@ -673,16 +707,31 @@ STATE_NAMES = {"waiting": "Ждём получателя", "confirm": "Ждём 
                "done": "Обработка завершена", "dry_run": "Тест без покупки", "cancelled": "Обработка закрыта"}
 
 
+def quantity_unit(rule):
+    return (rule.get("currency", "USD") if rule["kind"] == "steam"
+            else {"stars": "Stars", "premium": "мес.", "gift": "игра"}[rule["kind"]])
+
+
+def quantity_example(rule):
+    unit, qty = quantity_unit(rule), number(rule["quantity"])
+    if rule["kind"] in {"premium", "gift"}:
+        return f"Один заказ: 1 штука лота → {qty} {unit}."
+    return (f"Покупатель выбрал 1 шт. → получит {qty} {unit}.\n"
+            f"Покупатель выбрал 2 шт. → получит {qty * 2} {unit}.\n"
+            "Если общий объём выше максимума заказа, покупка остановится.")
+
+
 def rule_text(rule):
     kind = rule["kind"]
-    unit = rule.get("currency", "USD") if kind == "steam" else {"stars": "Stars", "premium": "мес.", "gift": "игра"}[kind]
+    unit = quantity_unit(rule)
     cost_unit = "USD" if kind in {"steam", "gift"} else "TON"
-    text = (f"{KIND_NAMES[kind]}\nЗа 1 единицу лота: {rule['quantity']} {unit}\n"
+    label = "Сумма пополнения за 1 штуку лота" if kind == "steam" else "Покупатель получает за 1 штуку лота"
+    text = (f"{KIND_NAMES[kind]}\n{label}: {rule['quantity']} {unit}\n"
             f"Максимум за заказ: {rule['max_quantity']} {unit}\n"
             f"Лимит {'котировки' if cost_unit == 'TON' else 'стоимости'}: {rule['max_cost']} {cost_unit}")
     if kind == "gift":
         text += f"\nПакет Steam (SUB_ID): {rule['sub_id']} · Регион: {rule['region']}"
-    return text
+    return text + "\n\n" + quantity_example(rule)
 
 
 class Panel:
@@ -747,7 +796,7 @@ class Panel:
                 f"Автопокупка: {'ВКЛ 🟢' if enabled else 'ВЫКЛ 🔴'}\n"
                 f"Режим: {'🧪 Тест — деньги не списываются' if cfg['dry_run'] else '💳 Реальные покупки'}\n"
                 f"Подключение: {'данные указаны' if connected else 'не настроено'}\n"
-                f"Настроено лотов: {len(cfg['lots'])}\n\n"
+                f"Настроено лотов: {len(cfg['lots'])}, на паузе: {sum(not r.get('enabled', True) for r in cfg['lots'].values())}\n\n"
                 "Как начать:\n1. Подключите GreenGamePay.\n2. Выберите лоты и настройте товар.\n"
                 "3. Включите автопокупку. Сначала проверьте тестовый режим.\n\n"
                 "Покупатель указывает получателя и подтверждает его в чате FunPay.")
@@ -759,6 +808,7 @@ class Panel:
         self.show(ctx, text, [
             [("🔑 Подключение", "connect"), ("💰 Баланс", "balance")],
             [("📦 Мои лоты", "lots:0"), ("📋 Заказы", "orders:0")],
+            [("🩺 Проверка готовности", "diagnostics"), ("📊 Сводка", "summary")],
             [("🟢 Включить автопокупку" if not enabled else "🔴 Остановить автопокупку", "enable" if not enabled else "disable")],
             [("✅ 🧪 Тестовый режим" if cfg["dry_run"] else "⬜ 🧪 Тестовый режим", "live" if cfg["dry_run"] else "test")],
             [("📚 Каталог поставщика", "catalog:0")],
@@ -780,12 +830,13 @@ class Panel:
         page = max(0, min(page, max(0, (len(items) - 1) // 6)))
         rows = []
         for lot_id, lot in items[page * 6:page * 6 + 6]:
-            label = ("✅ " if str(lot_id) in cfg["lots"] else "⬜ ") + f"#{lot_id} · "
+            rule = cfg["lots"].get(str(lot_id))
+            label = ("⏸ " if rule and not rule.get("enabled", True) else "✅ " if rule else "⬜ ") + f"#{lot_id} · "
             label += (lot.description or "Без названия")[:34] if lot else "Лот удалён с FunPay"
             rows.append([(label, f"lot:{lot_id}")])
         self.pager(rows, "lots", page, len(items), 6)
         rows.append([("⬅️ В главное меню", "home")])
-        self.show(ctx, "📦 Мои лоты\n\nВыберите лот для настройки.\n✅ — настроен; ⬜ — ещё не настроен.\n"
+        self.show(ctx, "📦 Мои лоты\n\nВыберите лот для настройки.\n✅ — настроен; ⏸ — пауза; ⬜ — не настроен.\n"
                   "Настройки применяются только к новым заказам.\n\n"
                   + (f"Страница {page + 1}" if items else "Лотов пока нет. Добавьте лот на FunPay и обновите профиль Cardinal."), rows)
 
@@ -805,11 +856,16 @@ class Panel:
         lot = self.e.c.profile.get_sorted_lots(1).get(int(lot_id))
         text = f"📦 Лот #{lot_id}\n\n" + ((lot.description or "Без названия")[:700] if lot else "Лот больше не найден на FunPay.")
         text += "\n\n" + (rule_text(rule) if rule else "Этот лот пока не подключён к GreenGamePay.")
+        if rule and not rule.get("enabled", True):
+            text += "\n\n⏸ Новые заказы этого лота не обрабатываются. Уже принятые продолжают выполняться."
         text += "\n\nОтключите для него стандартную автовыдачу Cardinal и другие плагины выдачи."
         rows = []
         if lot:
             rows.append([("⚙️ Изменить настройки" if rule else "➕ Настроить лот", f"setup:{lot_id}")])
         if rule:
+            rows.append([("🧮 Проверить расчёт", f"calculate:{lot_id}")])
+            rows.append([("⏸ Пауза для новых заказов" if rule.get("enabled", True) else "▶️ Принимать новые заказы",
+                          f"lotpause:{lot_id}" if rule.get("enabled", True) else f"lotresume:{lot_id}")])
             rows.append([("🗑 Отключить этот лот", f"unask:{lot_id}")])
         rows += [[("⬅️ К списку лотов", "lots:0")]]
         self.show(ctx, text, rows)
@@ -832,12 +888,17 @@ class Panel:
                         "Бот попробует удалить это сообщение. Данные сохраняются только на сервере Cardinal.",
             "kind": "📦 Настройка лота\n\nКакой товар получает покупатель?",
             "currency": "🎮 Валюта пополнения Steam\n\nВ какой валюте указан номинал вашего лота?\nЭто валюта пополнения, а не цена продажи на FunPay.",
-            "quantity": "📏 Объём товара\n\nСколько получает покупатель за 1 единицу лота?\n",
+            "quantity": "📏 Что получает покупатель\n\nПокупатель выбирает в заказе FunPay количество: 1, 2, 3 штуки.\n"
+                        "Сколько товара нужно выдать за 1 штуку?\n",
             "max_quantity": "📏 Максимум за заказ\n\nУкажите максимальный общий объём одного заказа.\n"
                             "Например: 50 Stars за единицу × 4 единицы = 200 Stars. Для такого заказа максимум должен быть не меньше 200.",
             "max_cost": "💰 Лимит стоимости\n\n",
             "sub_id": "🎁 Пакет игры Steam\n\nОтправьте SUB_ID пакета игры. Это ID пакета, а не APP_ID приложения.",
             "region": "🌍 Регион получателя\n\nДля какого региона аккаунта продаётся подарок?",
+            "calculate": "🧮 Калькулятор заказа\n\n" + (quantity_example(rule) if step == "calculate" else "")
+                         + "\n\nВведите число штук, которое покупатель выбрал на FunPay. Например: 2.\n"
+                         "Это только расчёт: покупка не создаётся и деньги не списываются.",
+            "findorder": "🔎 Поиск заказа\n\nОтправьте номер заказа FunPay, например AB123 или #AB123.",
             "review": "✅ Проверьте настройки\n\n" + (rule_text(rule) if step == "review" else "") + "\n\nСохранить для новых заказов этого лота?"}
         text = prompts[step]
         if step == "kind":
@@ -853,11 +914,17 @@ class Panel:
                 text += "Выберите длительность подписки. Один заказ FunPay — одна подписка."
                 rows = [[(value + " мес.", "months:" + value) for value in ("3", "6", "12")]]
             else:
-                text += (f"Отправьте сумму пополнения в {rule.get('currency', 'USD')}. Например: 100."
-                         if kind == "steam" else "Отправьте целое число Stars, минимум 50. Например: 50.")
+                currency = rule.get("currency", "USD")
+                text += (f"\nВведите сумму, которую покупатель получит на Steam, в {currency}.\n"
+                         f"Пример: вводите 100 → за 1 шт. начисляем 100 {currency}, за 2 шт. — 200 {currency}.\n"
+                         "Цену продажи вы отдельно задаёте на FunPay."
+                         if kind == "steam" else "\nВведите число Stars за 1 штуку лота, минимум 50.\n"
+                         "Пример: вводите 50 → за 1 шт. выдаём 50 Stars, за 2 шт. — 100 Stars.")
         elif step == "max_quantity":
-            text = text.split("Например:")[0] + "\nСейчас за 1 единицу: " + rule["quantity"] + "\n"
-            text += "Введите верхний предел в тех же единицах. Он должен быть не меньше объёма за 1 единицу."
+            text = ("📏 Максимум за один заказ\n\n" + quantity_example(rule) + "\n\n"
+                    f"Введите максимальный общий объём в {quantity_unit(rule)}.\n"
+                    f"Он должен быть не меньше {rule['quantity']} {quantity_unit(rule)}.\n"
+                    "Это ограничение объёма товара, а не цена продажи.")
         elif step == "max_cost":
             text += ("Укажите максимум в USD на весь заказ. Например: 10. Проверяем стоимость до оплаты."
                      if rule["kind"] in {"steam", "gift"} else
@@ -908,7 +975,25 @@ class Panel:
             return
         text, data, step = message.text.strip(), state["data"], state["step"]
         try:
-            if step == "login":
+            if step == "calculate":
+                units = integer(text, "число штук лота")
+                rule = data["rule"]
+                total = order_quantity(rule, units)
+                self.clear(ctx)
+                self.show(ctx, "🧮 Расчёт заказа\n\n"
+                          f"Покупатель выбрал: {units} шт.\n"
+                          f"За 1 шт. получает: {rule['quantity']} {quantity_unit(rule)}\n"
+                          f"Итого получит: {total} {quantity_unit(rule)}\n\n"
+                          "✅ Общий объём укладывается в лимит.\n"
+                          "Расчёт не проверяет остатки, курс или баланс поставщика. Покупка не создавалась.",
+                          [[("🧮 Другой расчёт", "calculate:" + data["lot_id"])],
+                           [("⬅️ К лоту", "lot:" + data["lot_id"])]])
+            elif step == "findorder":
+                order_id = text.lstrip("#").upper()
+                if not re.fullmatch(r"[A-Z0-9]{1,32}", order_id) or not self.e.ledger.get(order_id):
+                    raise GGPError("Заказ не найден в журнале плагина. Проверьте номер и отправьте его ещё раз.")
+                self.order(ctx, order_id)
+            elif step == "login":
                 if not text or len(text) > 200 or "\n" in text:
                     raise GGPError("Отправьте логин одной строкой.")
                 data["login"] = text
@@ -981,9 +1066,80 @@ class Panel:
         rows = [[(f"#{row['id']} · {STATE_NAMES.get(row['state'], row['state'])}", "order:" + row["id"])]
                 for row in orders[page * 6:page * 6 + 6]]
         self.pager(rows, "orders", page, len(orders), 6)
-        rows += [[("🔄 Обновить список", f"orders:{page}")], [("⬅️ В главное меню", "home")]]
+        rows += [[("🔎 Найти по номеру", "findorder")],
+                 [("🔄 Обновить список", f"orders:{page}")], [("⬅️ В главное меню", "home")]]
         self.show(ctx, "📋 Заказы\n\n" + ("Выберите заказ, чтобы посмотреть статус и доступные действия.\n"
                   "Журнал сохраняется после перезапуска." if orders else "Заказов ещё нет. Здесь появятся покупки настроенных лотов."), rows)
+
+    def diagnostics(self, ctx):
+        self.clear(ctx)
+        cfg, c = self.e.config.snapshot(), self.e.c
+        plugin = c.plugins.get(UUID)
+        credentials = bool((os.environ.get("GGP_USERNAME") or cfg["username"])
+                           and (os.environ.get("GGP_PASSWORD") or cfg["password"]))
+        lines = [("✅" if plugin and plugin.enabled else "⚠️") + " Плагин в Cardinal: "
+                 + ("включён" if plugin and plugin.enabled else "включите в карточке плагина"),
+                 ("⚠️ Отключите старый режим сообщений Cardinal" if c.old_mode_enabled else "✅ Новый режим сообщений"),
+                 ("✅ Данные GreenGamePay указаны" if credentials else "⚠️ Введите данные GreenGamePay в «Подключении»"),
+                 ("🧪 Сейчас тестовый режим, покупок не будет" if cfg["dry_run"] else "💳 Сейчас режим реальных покупок"),
+                 ("🟢 Автопокупка включена" if self.e.active() else "⏸ Автопокупка остановлена")]
+        lots = c.profile.get_sorted_lots(1)
+        enabled = {key: rule for key, rule in cfg["lots"].items() if rule.get("enabled", True)}
+        issues = []
+        if not enabled:
+            issues.append("Нет подключённых лотов без паузы. Настройте или возобновите лот.")
+        native_cfg = getattr(c, "AD_CFG", {})
+        def signature(item):
+            return (item.description, getattr(item.subcategory, "id", None), item.server or "", item.side or "")
+
+        for key in enabled:
+            lot = lots.get(int(key))
+            if not lot:
+                issues.append(f"#{key}: лот не найден в профиле Cardinal.")
+                continue
+            if sum(signature(item) == signature(lot) for item in lots.values()) != 1:
+                issues.append(f"#{key}: совпадающие названия лотов. Сделайте название уникальным.")
+            if getattr(lot, "auto", False):
+                issues.append(f"#{key}: отключите автовыдачу самого FunPay.")
+            description = ", ".join(str(part) for part in (lot.server, lot.side, lot.description) if part)
+            for match in (lambda name: name == description, lambda name: description.startswith(name),
+                          lambda name: name in description):
+                names = [name for name in native_cfg if name and name != "DEFAULT" and match(name)]
+                if not names:
+                    continue
+                section = native_cfg[max(names, key=len)]
+                disabled = (section.getboolean("disable") if hasattr(section, "getboolean")
+                            else str(section.get("disable", False)).lower() in {"1", "true", "yes", "on"})
+                if not disabled:
+                    issues.append(f"#{key}: отключите стандартную автовыдачу Cardinal для этого лота.")
+                break
+        lines.append(f"📦 Лотов без паузы: {len(enabled)}; на паузе: {len(cfg['lots']) - len(enabled)}")
+        lines += ["⚠️ " + item for item in issues[:10]]
+        if len(issues) > 10:
+            lines.append(f"Ещё замечаний: {len(issues) - 10}. Исправьте показанные и обновите проверку.")
+        elif not issues:
+            lines.append("✅ Конфликтов лотов в текущем профиле не найдено")
+        self.show(ctx, "🩺 Проверка готовности\n\n" + "\n".join(lines)
+                  + "\n\nЭто проверка локальных настроек по текущему профилю Cardinal. "
+                  "Пароль, доступность товара и баланс здесь не проверяются. "
+                  "Для проверки подключения нажмите кнопку ниже. Другие плагины выдачи нужно отключить самостоятельно.",
+                  [[("🔍 Проверить подключение и баланс", "balance")], [("📦 Исправить настройки лотов", "lots:0")],
+                   [("🔄 Проверить ещё раз", "diagnostics")], [("⬅️ В главное меню", "home")]])
+
+    def summary(self, ctx):
+        self.clear(ctx)
+        data = self.e.ledger.summary()
+        self.show(ctx, "📊 Сводка заказов\n\n"
+                  f"Всего в журнале: {data['total']}\nНовых за последние 24 часа: {data['last24']}\n\n"
+                  f"💬 Ждём покупателя: {data['waiting']}\n🟠 Требуют внимания: {data['attention']}\n"
+                  f"⏳ Запрос выполняется: {data['processing']}\n"
+                  f"💳 Оплата подтверждена поставщиком: {data['paid']}\n"
+                  f"✍️ Завершены вручную: {data['manual']}\n🧪 Тестовые: {data['dry_run']}\n"
+                  f"🚫 Закрыты / отменены: {data['cancelled']}\n\n"
+                  "Состояния показаны за всё время. Подтверждённая оплата не означает независимую проверку доставки. "
+                  "Закрытие записи не выполняет возврат денег.",
+                  [[("📋 Открыть заказы", "orders:0")], [("🔄 Обновить сводку", "summary")],
+                   [("⬅️ В главное меню", "home")]])
 
     def order(self, ctx, order_id):
         self.clear(ctx)
@@ -1033,6 +1189,23 @@ class Panel:
         cfg = self.e.config.snapshot()
         if action == "home":
             self.home(ctx)
+        elif action == "diagnostics":
+            self.diagnostics(ctx)
+        elif action == "summary":
+            self.summary(ctx)
+        elif action == "findorder":
+            self.begin(ctx, "findorder")
+        elif action == "calculate":
+            rule = cfg["lots"].get(arg)
+            if not rule:
+                raise GGPError("Сначала настройте этот лот.")
+            self.begin(ctx, "calculate", lot_id=arg, rule=copy.deepcopy(rule))
+        elif action in {"lotpause", "lotresume"}:
+            if arg not in cfg["lots"]:
+                raise GGPError("Привязка лота не найдена.")
+            cfg["lots"][arg]["enabled"] = action == "lotresume"
+            self.e.config.save(cfg)
+            self.lot(ctx, arg)
         elif action in {"enable", "disable", "test", "live_yes"}:
             self.clear(ctx)
             if action == "enable" and self.e.c.old_mode_enabled:
@@ -1085,7 +1258,8 @@ class Panel:
             lot_id = str(integer(arg, "ID лота"))
             if int(lot_id) not in self.e.c.profile.get_sorted_lots(1):
                 raise GGPError("Лот не найден. Обновите профиль Cardinal.")
-            self.begin(ctx, "kind", lot_id=lot_id, rule={})
+            self.begin(ctx, "kind", lot_id=lot_id,
+                       rule={"enabled": cfg["lots"].get(lot_id, {}).get("enabled", True)})
         elif action in {"kind", "currency", "months", "region", "save"}:
             self.wizard_action(ctx, action, arg)
         elif action == "unask":
