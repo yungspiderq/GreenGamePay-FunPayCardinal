@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert callable(metadata["BIND_TO_DELETE"])
         assert callable(module.BIND_TO_NEW_ORDER[0])
         assert callable(module.BIND_TO_NEW_MESSAGE[0])
+        assert callable(module.BIND_TO_POST_START[0])
         print("Cardinal loader: PASS", metadata["NAME"], metadata["VERSION"])
     finally:
         os.chdir(previous)

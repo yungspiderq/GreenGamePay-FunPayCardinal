@@ -820,3 +820,342 @@ def test_funpay_native_delivery_cannot_trigger_second_purchase(env, auto, secret
     engine.new_order(event)
     assert engine.ledger.get("AB123") is None
     assert not api.calls
+
+
+@pytest.fixture
+def guard_env(env):
+    engine, _, c, api = env
+    cfg = engine.config.snapshot()
+    cfg.update(username="user", password="password", dry_run=False)
+    cfg["balance_guard"] = {"enabled": True, "USD": "10", "TON": "2"}
+    engine.config.save(cfg)
+    offers = {123: NS(lot_id=123, active=True, price=12, title="Original title", description="keep me")}
+    c.account.get_lot_fields = Mock(side_effect=lambda lot_id: copy.deepcopy(offers[lot_id]))
+    def save(fields, *args, **kwargs):
+        offers[fields.lot_id] = copy.deepcopy(fields)
+    original = Mock(side_effect=save)
+    c.account.save_lot = original
+    api.overrides.update(check_balance=5, get_ton_balance=1)
+    return engine, c, api, offers, original
+
+
+def test_guard_really_disables_offer_and_preserves_other_fields(guard_env):
+    engine, _, _, offers, save = guard_env
+    engine.balance_guard.check()
+    assert not offers[123].active
+    assert offers[123].price == 12 and offers[123].title == "Original title"
+    assert offers[123].description == "keep me"
+    assert save.call_count == 1
+    assert engine.ledger.holds()["123"]["disabled"] is True
+    engine.balance_guard.check()
+    assert save.call_count == 1
+
+
+@pytest.mark.parametrize("balance,threshold,disabled", [(10, "10", True), (10.01, "10", False),
+    (0, "0", True), (0.01, "0", False)])
+def test_guard_boundary_and_zero(guard_env, balance, threshold, disabled):
+    engine, _, api, offers, _ = guard_env
+    cfg = engine.config.snapshot()
+    cfg["balance_guard"]["USD"] = threshold
+    engine.config.save(cfg)
+    api.overrides["check_balance"] = balance
+    engine.balance_guard.check()
+    assert offers[123].active is not disabled
+
+
+@pytest.mark.parametrize("response", [None, True, {}, {"balance": 0}, "NaN", "Infinity", -1, "unavailable"])
+def test_guard_invalid_balance_never_means_zero(guard_env, response):
+    engine, _, api, offers, save = guard_env
+    api.overrides["check_balance"] = response
+    engine.balance_guard.check()
+    assert offers[123].active
+    assert not save.called and not engine.ledger.holds()
+    assert engine.balance_guard.status["USD"]["error"] is True
+
+
+def test_guard_network_error_does_not_remove_existing_hold_or_spam(guard_env):
+    engine, c, api, offers, save = guard_env
+    engine.balance_guard.check()
+    before = c.telegram.send_notification.call_count
+    api.fail = "check_balance"
+    engine.balance_guard.check()
+    engine.balance_guard.check()
+    assert c.telegram.send_notification.call_count == before + 1
+    assert "123" in engine.ledger.holds() and save.call_count == 1
+    assert not offers[123].active
+
+
+def test_guard_uses_correct_currency_and_ignores_unmapped_lots(guard_env):
+    engine, _, api, offers, save = guard_env
+    cfg = engine.config.snapshot()
+    cfg["lots"]["124"] = dict(kind="stars", quantity="50", max_quantity="100", max_cost="5")
+    cfg["lots"]["125"] = dict(kind="premium", quantity="3", max_quantity="3", max_cost="10")
+    engine.config.save(cfg)
+    for lot_id in [124, 125, 999]:
+        offers[lot_id] = NS(lot_id=lot_id, active=True)
+    api.overrides["check_balance"] = 100
+    engine.balance_guard.check()
+    assert offers[123].active and offers[999].active
+    assert not offers[124].active and not offers[125].active
+    assert save.call_count == 2
+
+
+def test_guard_disabled_and_test_mode_do_not_mutate_funpay(guard_env):
+    engine, _, api, offers, save = guard_env
+    cfg = engine.config.snapshot()
+    cfg["balance_guard"]["enabled"] = False
+    engine.config.save(cfg)
+    engine.balance_guard.check()
+    assert not api.calls
+    cfg["balance_guard"]["enabled"] = True
+    cfg["dry_run"] = True
+    engine.config.save(cfg)
+    engine.balance_guard.check()
+    assert api.calls and offers[123].active
+    assert not save.called and not engine.ledger.holds()
+
+
+def test_guard_works_with_paused_processing_and_paused_lot(guard_env):
+    engine, _, _, offers, _ = guard_env
+    cfg = engine.config.snapshot()
+    cfg["enabled"] = False
+    cfg["lots"]["123"]["enabled"] = False
+    engine.config.save(cfg)
+    engine.balance_guard.check()
+    assert not offers[123].active
+
+
+def test_guard_respects_disabled_cardinal_plugin(guard_env):
+    engine, c, api, offers, _ = guard_env
+    c.plugins[g.UUID].enabled = False
+    engine.balance_guard.check()
+    assert offers[123].active and not api.calls
+
+
+def test_guard_blocks_cardinal_autorestore_but_allows_other_edits(guard_env):
+    engine, c, _, offers, save = guard_env
+    engine.balance_guard.check()
+    fields = c.account.get_lot_fields(123)
+    fields.active = True
+    with pytest.raises(g.GGPError):
+        c.account.save_lot(fields)
+    assert not offers[123].active and save.call_count == 1
+    fields.active = False
+    fields.price = 15
+    c.account.save_lot(fields)
+    assert offers[123].price == 15
+    offers[999] = NS(lot_id=999, active=False)
+    c.account.save_lot(NS(lot_id=999, active=True))
+    assert offers[999].active
+
+
+def test_guard_failed_save_retries_and_only_reports_confirmed_success(guard_env):
+    engine, c, _, offers, save = guard_env
+    original = save.side_effect
+    save.side_effect = RuntimeError("private-error")
+    engine.balance_guard.check()
+    assert offers[123].active and "123" in engine.ledger.holds()
+    assert "Сняты с продажи" not in str(c.telegram.send_notification.call_args_list)
+    assert "private-error" not in str(c.telegram.send_notification.call_args_list)
+    save.side_effect = original
+    engine.balance_guard.check()
+    assert not offers[123].active
+    assert "Сняты с продажи" in str(c.telegram.send_notification.call_args_list)
+
+
+def test_guard_checks_remote_state_after_save(guard_env):
+    engine, c, _, offers, save = guard_env
+    save.side_effect = lambda fields: None
+    engine.balance_guard.check()
+    assert offers[123].active
+    assert "не удалось" in str(c.telegram.send_notification.call_args_list).lower()
+    assert "Сняты с продажи" not in str(c.telegram.send_notification.call_args_list)
+
+
+def test_guard_hold_survives_restart_and_wrapper_is_restored(guard_env):
+    engine, c, api, _, original = guard_env
+    root = engine.config.path.parent
+    engine.balance_guard.check()
+    engine.close()
+    assert c.account.save_lot is original
+    restarted = g.Engine(c, root, api)
+    try:
+        restarted.balance_guard.install()
+        with pytest.raises(g.GGPError):
+            c.account.save_lot(NS(lot_id=123, active=True))
+    finally:
+        restarted.close()
+
+
+def test_guard_recovery_requires_manual_restore_and_fresh_balance(guard_env):
+    engine, _, api, offers, save = guard_env
+    engine.balance_guard.check()
+    api.overrides["check_balance"] = 20
+    engine.balance_guard.check()
+    assert not offers[123].active
+    count = len(api.calls)
+    restored, released, errors = engine.balance_guard.restore()
+    assert offers[123].active and restored == ["123"] and not released and not errors
+    assert len(api.calls) > count
+    assert not engine.ledger.holds() and save.call_count == 2
+
+
+def test_guard_restore_never_activates_previously_inactive_lot(guard_env):
+    engine, _, api, offers, save = guard_env
+    offers[123].active = False
+    engine.balance_guard.check()
+    assert not engine.ledger.holds()["123"]["disabled"]
+    api.overrides["check_balance"] = 20
+    restored, released, errors = engine.balance_guard.restore()
+    assert not offers[123].active and not save.called
+    assert not restored and released == ["123"] and not errors
+
+
+@pytest.mark.parametrize("error", ["low", "network", "test", "disabled"])
+def test_guard_does_not_restore_without_permission_and_balance(guard_env, error):
+    engine, _, api, offers, _ = guard_env
+    engine.balance_guard.check()
+    if error == "network":
+        api.fail = "check_balance"
+    if error in {"test", "disabled"}:
+        cfg = engine.config.snapshot()
+        if error == "test":
+            cfg["dry_run"] = True
+        else:
+            cfg["balance_guard"]["enabled"] = False
+        engine.config.save(cfg)
+        with pytest.raises(g.GGPError):
+            engine.balance_guard.restore()
+    else:
+        restored, _, errors = engine.balance_guard.restore()
+        assert not restored and errors
+    assert not offers[123].active
+
+
+def test_guard_currency_error_does_not_stop_other_currency(guard_env):
+    engine, _, api, offers, _ = guard_env
+    cfg = engine.config.snapshot()
+    cfg["lots"]["124"] = dict(kind="stars", quantity="50", max_quantity="100", max_cost="5")
+    engine.config.save(cfg)
+    offers[124] = NS(lot_id=124, active=True)
+    api.fail = "check_balance"
+    engine.balance_guard.check()
+    assert offers[123].active and not offers[124].active
+
+
+def test_guard_checks_after_purchase(guard_env, env):
+    engine, _, _, offers, _ = guard_env
+    msg = prepare(env)
+    engine.message(msg)
+    done = threading.Event()
+    engine.submit(done.set)
+    assert done.wait(5)
+    assert not offers[123].active
+
+
+def test_guard_monitor_starts_once_and_stops(guard_env):
+    engine, _, api, _, _ = guard_env
+    checked = threading.Event()
+    original = api.call
+    def call(endpoint, payload=None, **kwargs):
+        result = original(endpoint, payload, **kwargs)
+        if endpoint == "check_balance":
+            checked.set()
+        return result
+    api.call = call
+    engine.balance_guard.start()
+    thread = engine.balance_guard.thread
+    engine.balance_guard.start()
+    assert thread is engine.balance_guard.thread
+    assert checked.wait(5)
+    engine.balance_guard.stop()
+    thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_guard_check_queue_is_coalesced(guard_env):
+    engine = guard_env[0]
+    with engine.lock:
+        for _ in range(10):
+            engine.balance_guard.request()
+    done = threading.Event()
+    engine.submit(done.set)
+    assert done.wait(5)
+    assert sum(name == "check_balance" for name, _ in guard_env[2].calls) == 1
+
+
+def test_legacy_configuration_gets_guard_disabled(tmp_path):
+    legacy = {"enabled": True, "dry_run": False, "username": "u", "password": "p", "lots": {}}
+    (tmp_path / "config.json").write_text(json.dumps(legacy))
+    config = g.Config(tmp_path).snapshot()
+    assert config["balance_guard"] == {"enabled": False, "USD": None, "TON": None}
+
+
+@pytest.mark.parametrize("value", ["-1", "NaN", "Infinity", True, "invalid"])
+def test_guard_rejects_invalid_thresholds(tmp_path, value):
+    cfg = g.Config(tmp_path)
+    data = cfg.snapshot()
+    data["balance_guard"]["USD"] = value
+    with pytest.raises(g.GGPError):
+        cfg.save(data)
+
+
+def test_guard_threshold_ui_and_zero(ui):
+    ui.click("guard")
+    ui.click("guardset:USD")
+    ui.type("10,5")
+    assert "≤ 10.5 USD" in ui.text
+    ui.click("guardset:TON")
+    ui.type("0")
+    assert "≤ 0 TON" in ui.text
+    assert ui.engine.config.snapshot()["balance_guard"]["enabled"] is False
+
+
+def test_guard_cannot_enable_without_threshold(ui):
+    ui.click("guard")
+    ui.click("guardon")
+    assert "Сначала задайте" in ui.text
+    assert not ui.engine.config.snapshot()["balance_guard"]["enabled"]
+
+
+def test_guard_ui_manual_check_and_restore_confirmation(ui, guard_env):
+    ui.click("guard")
+    ui.click("guardcheck")
+    assert not guard_env[3][123].active
+    guard_env[2].overrides["check_balance"] = 50
+    ui.click("guardrestoreask")
+    assert not guard_env[3][123].active
+    ui.click("guardrestore")
+    assert guard_env[3][123].active
+    assert "Возвращено в продажу: 1" in ui.text
+
+
+def test_guard_ui_disable_requires_click_and_releases_autorestore(ui, guard_env):
+    ui.click("guard")
+    ui.click("guardcheck")
+    ui.click("guardoffask")
+    assert ui.engine.balance_guard.enabled()
+    ui.click("guardoff")
+    assert not ui.engine.balance_guard.enabled()
+    guard_env[1].account.save_lot(NS(lot_id=123, active=True))
+    assert guard_env[3][123].active
+
+
+def test_guard_stops_if_plugin_disabled_during_funpay_read(guard_env):
+    engine, c, _, offers, save = guard_env
+    def read(lot_id):
+        c.plugins[g.UUID].enabled = False
+        return copy.deepcopy(offers[lot_id])
+    c.account.get_lot_fields.side_effect = read
+    engine.balance_guard.check()
+    assert offers[123].active and not save.called
+
+
+def test_guard_recovery_notification_is_not_repeated_for_varying_balances(guard_env):
+    engine, c, api, _, _ = guard_env
+    engine.balance_guard.check()
+    for value in [20, 21, 22]:
+        api.overrides["check_balance"] = value
+        engine.balance_guard.check()
+    notices = [str(call) for call in c.telegram.send_notification.call_args_list]
+    assert sum("выше порога" in text for text in notices) == 1

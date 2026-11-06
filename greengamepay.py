@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import requests
 
 NAME = "GreenGamePay"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESCRIPTION = "Steam, Telegram Stars/Premium и подарки Steam через GreenGamePay. /ggp"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "e375b82f-b750-4dbe-bbc0-9731c39acf0a"
@@ -28,7 +28,8 @@ SETTINGS_PAGE = True
 BASE_URL = "https://пополнистим.рф"
 ROOT = Path("storage/plugins/greengamepay")
 LOG = logging.getLogger("FPC.GreenGamePay")
-DEFAULT_CONFIG = {"enabled": False, "dry_run": True, "username": "", "password": "", "lots": {}}
+DEFAULT_CONFIG = {"enabled": False, "dry_run": True, "username": "", "password": "", "lots": {},
+                  "balance_guard": {"enabled": False, "USD": None, "TON": None}}
 KINDS = {"steam", "stars", "premium", "gift"}
 IN_FLIGHT = {"creating", "paying"}
 
@@ -134,6 +135,12 @@ class Config:
         for lot, rule in data["lots"].items():
             integer(lot, "lot_id")
             validate_rule(rule)
+        guard = data.get("balance_guard", DEFAULT_CONFIG["balance_guard"])
+        if not isinstance(guard, dict) or type(guard.get("enabled")) is not bool:
+            raise GGPError("Некорректные настройки контроля баланса.")
+        for currency in ("USD", "TON"):
+            if guard.get(currency) is not None:
+                number(guard[currency], "порог " + currency, allow_zero=True)
 
     def snapshot(self):
         with self.lock:
@@ -162,6 +169,7 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, state TEXT NOT NULL, body TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS balance_holds (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
         try:
             os.chmod(self.path, 0o600)
         except OSError:
@@ -223,6 +231,18 @@ class Ledger:
             row = json.loads(body)
             row.update(state="review", error="Перезапуск во время запроса. Проверьте заказ у поставщика.")
             self.put(row)
+
+    def holds(self):
+        with self.connect() as db:
+            return {key: json.loads(body) for key, body in db.execute("SELECT id, body FROM balance_holds")}
+
+    def hold(self, lot_id, data):
+        with self.connect() as db:
+            db.execute("INSERT OR REPLACE INTO balance_holds VALUES (?, ?)", (str(lot_id), json.dumps(data)))
+
+    def release_hold(self, lot_id):
+        with self.connect() as db:
+            db.execute("DELETE FROM balance_holds WHERE id=?", (str(lot_id),))
 
 
 class InstanceLock:
@@ -312,6 +332,208 @@ class API:
         return self._request(endpoint, payload, self.token, method, params)
 
 
+def balance_currency(rule):
+    return "USD" if rule["kind"] in {"steam", "gift"} else "TON"
+
+
+class BalanceGuard:
+    """Deactivate only mapped offers; persist holds before touching FunPay."""
+    def __init__(self, engine):
+        self.e = engine
+        self.status = {}
+        self.notices = {}
+        self.gate = threading.RLock()
+        self.queue_lock = threading.Lock()
+        self.queued = False
+        self.exit = threading.Event()
+        self.thread = None
+        self.original_save = None
+        self.wrapped_save = None
+
+    def enabled(self):
+        plugin = self.e.c.plugins.get(UUID)
+        return (not self.e.stopped and bool(plugin and plugin.enabled)
+                and self.e.config.snapshot()["balance_guard"]["enabled"])
+
+    def blocked(self, lot_id):
+        cfg = self.e.config.snapshot()
+        rule = cfg["lots"].get(str(lot_id))
+        return (self.enabled() and not cfg["dry_run"] and bool(rule)
+                and cfg["balance_guard"].get(balance_currency(rule)) is not None
+                and str(lot_id) in self.e.ledger.holds())
+
+    def install(self):
+        if self.original_save is not None:
+            return
+        self.original_save = self.e.c.account.save_lot
+
+        def save_lot(fields, *args, **kwargs):
+            with self.gate:
+                if getattr(fields, "active", False) and self.blocked(fields.lot_id):
+                    raise GGPError("Лот снят контролем баланса GreenGamePay. Верните его через /ggp → Контроль баланса.")
+                return self.original_save(fields, *args, **kwargs)
+
+        self.wrapped_save = save_lot
+        self.e.c.account.save_lot = save_lot
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.install()
+        def monitor():
+            while not self.exit.is_set() and not self.e.stopped:
+                self.request()
+                if self.exit.wait(60):
+                    break
+        self.thread = threading.Thread(target=monitor, name="GGP-balance", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.exit.set()
+        if self.wrapped_save is not None and self.e.c.account.save_lot is self.wrapped_save:
+            self.e.c.account.save_lot = self.original_save
+
+    def request(self):
+        if not self.enabled():
+            return
+        with self.queue_lock:
+            if self.queued or self.e.stopped:
+                return
+            self.queued = True
+        def run():
+            try:
+                self.check()
+            finally:
+                with self.queue_lock:
+                    self.queued = False
+        self.e.submit(run)
+
+    def notice(self, key, text):
+        # Repeated errors do not flood the administrator every minute.
+        previous, when = self.notices.get(key, (None, 0))
+        if previous != text or time.time() - when >= 3600:
+            self.e.notify(text)
+            self.notices[key] = (text, time.time())
+
+    def fetch(self, currency):
+        value = self.e.api.call("check_balance" if currency == "USD" else "get_ton_balance")
+        # bool, mappings and strings with arbitrary response bodies are never balances.
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+            raise GGPError("Неизвестный формат баланса " + currency)
+        return number(value, "баланс " + currency, allow_zero=True)
+
+    def check(self):
+        if not self.enabled():
+            return
+        self.install()
+        cfg = self.e.config.snapshot()
+        for currency in ("USD", "TON"):
+            threshold = cfg["balance_guard"].get(currency)
+            # Paused mappings remain covered: a processing pause does not remove an offer from sale.
+            lot_ids = [key for key, rule in cfg["lots"].items() if balance_currency(rule) == currency]
+            if threshold is None or not lot_ids:
+                continue
+            try:
+                value = self.fetch(currency)
+            except Exception:
+                self.status[currency] = {"error": True, "checked": time.time()}
+                self.notice("fetch:" + currency, f"Не удалось проверить баланс {currency}. "
+                            "Новые лоты не снимаются по ошибке API; прежние запреты включения сохранены.")
+                continue
+            self.notices.pop("fetch:" + currency, None)
+            low = value <= number(threshold, allow_zero=True)
+            self.status[currency] = {"balance": str(value), "low": low, "checked": time.time(), "dry_run": cfg["dry_run"]}
+            if not low:
+                self.notices.pop("dry:" + currency, None)
+                holds = self.e.ledger.holds()
+                if any(key in holds for key in lot_ids) and "recovered:" + currency not in self.notices:
+                    self.notice("recovered:" + currency, f"Баланс {currency} выше порога ({value} > {threshold}). "
+                                "Для возврата снятых лотов: /ggp → Контроль баланса → Вернуть лоты после пополнения.")
+                continue
+            self.notices.pop("recovered:" + currency, None)
+            if cfg["dry_run"]:
+                if "dry:" + currency not in self.notices:
+                    self.notice("dry:" + currency, f"Тест контроля баланса: {value} {currency} ≤ {threshold}. "
+                                f"Были бы сняты лоты: {', '.join(lot_ids[:20])}. В тестовом режиме FunPay не изменяется.")
+                continue
+            changed = []
+            for lot_id in lot_ids:
+                if not self.enabled() or self.e.config.snapshot()["dry_run"]:
+                    return
+                try:
+                    with self.gate:
+                        record = self.e.ledger.holds().get(lot_id, {"currency": currency, "disabled": False})
+                        self.e.ledger.hold(lot_id, record)
+                        fields = self.e.c.account.get_lot_fields(int(lot_id))
+                        if fields.active:
+                            if not self.enabled() or self.e.config.snapshot()["dry_run"]:
+                                return
+                            # Remember ownership before save: a timeout might still have deactivated the offer.
+                            record.update(disabled=True, currency=currency)
+                            self.e.ledger.hold(lot_id, record)
+                            fields.active = False
+                            self.e.c.account.save_lot(fields)
+                            if self.e.c.account.get_lot_fields(int(lot_id)).active:
+                                raise GGPError("FunPay не подтвердил снятие лота.")
+                            changed.append(lot_id)
+                    self.notices.pop("lot:" + lot_id, None)
+                except Exception:
+                    self.notice("lot:" + lot_id, f"Не удалось подтвердить снятие лота #{lot_id} с продажи. "
+                                "Проверьте его на FunPay. Следующая проверка повторит попытку.")
+            if changed:
+                self.e.notify(f"Низкий баланс: {value} {currency} ≤ {threshold}. "
+                              "Сняты с продажи на FunPay: " + ", ".join("#" + key for key in changed[:30])
+                              + (f" и ещё {len(changed) - 30}" if len(changed) > 30 else "")
+                              + ". Автовосстановление этих лотов через Cardinal заблокировано.")
+
+    def restore(self):
+        if not self.enabled() or self.e.config.snapshot()["dry_run"]:
+            raise GGPError("Для возврата лотов включите контроль баланса и реальный режим.")
+        self.install()
+        cfg = self.e.config.snapshot()
+        restored, released, errors = [], [], []
+        balances = {}
+        for lot_id, record in self.e.ledger.holds().items():
+            rule = cfg["lots"].get(lot_id)
+            if not rule:
+                errors.append(f"#{lot_id}: привязка удалена — проверьте лот вручную")
+                continue
+            currency = balance_currency(rule)
+            threshold = cfg["balance_guard"].get(currency)
+            try:
+                if threshold is None:
+                    raise GGPError("сначала задайте порог " + currency)
+                if currency not in balances:
+                    try:
+                        balances[currency] = self.fetch(currency)
+                    except Exception:
+                        balances[currency] = None
+                value = balances[currency]
+                if value is None:
+                    raise GGPError("не удалось получить свежий баланс " + currency)
+                if value <= number(threshold, allow_zero=True):
+                    raise GGPError("баланс ещё не выше порога " + currency)
+                if not self.enabled() or self.e.config.snapshot()["dry_run"]:
+                    raise GGPError("контроль остановлен")
+                with self.gate:
+                    if record["disabled"]:
+                        fields = self.e.c.account.get_lot_fields(int(lot_id))
+                        if not fields.active:
+                            if not self.enabled() or self.e.config.snapshot()["dry_run"]:
+                                raise GGPError("контроль остановлен до включения лота")
+                            fields.active = True
+                            self.original_save(fields)  # Explicit user-requested restoration; bypass own hold.
+                        if not self.e.c.account.get_lot_fields(int(lot_id)).active:
+                            raise GGPError("FunPay не подтвердил включение")
+                        restored.append(lot_id)
+                    else:
+                        released.append(lot_id)  # Was already inactive: never enable it on user's behalf.
+                    self.e.ledger.release_hold(lot_id)
+            except Exception as exc:
+                errors.append(f"#{lot_id}: " + (str(exc) if isinstance(exc, GGPError) else "ошибка FunPay; проверьте лот"))
+        return restored, released, errors
+
+
 class Engine:
     def __init__(self, cardinal, root=ROOT, api=None):
         self.c = cardinal
@@ -325,6 +547,7 @@ class Engine:
         self.stopped = False
         self.paused = threading.Event()
         self.panel = Panel(self)
+        self.balance_guard = BalanceGuard(self)
 
     def active(self):
         plugin = self.c.plugins.get(UUID)
@@ -333,6 +556,7 @@ class Engine:
 
     def close(self):
         self.stopped = True
+        self.balance_guard.stop()
         self.pool.shutdown(wait=True, cancel_futures=True)
         self.instance_lock.close()
 
@@ -542,6 +766,8 @@ class Engine:
             self.phase(row, state, error=error)
             self.tell(row, f"#{row['id']}: заказ передан продавцу для проверки. Повторная покупка автоматически не выполняется.")
             self.notify(f"#{row['id']} [{state}]: {error}\ncustom_id: {row['custom_id']}")
+        finally:
+            self.balance_guard.request()
 
     def pay_created(self, row, endpoint):
         self.verify_order(row)
@@ -639,6 +865,7 @@ def telegram_command(engine, message):
                 engine.config.save(cfg)
                 if command == "/ggp_on":
                     engine.paused.clear()
+                engine.balance_guard.request()
                 reply(f"Включён: {cfg['enabled']}; тестовый режим: {cfg['dry_run']}.")
             elif command == "/ggp_bind":
                 lot_id, _, body = argument.partition(" ")
@@ -807,6 +1034,7 @@ class Panel:
             text += "\n\n" + note
         self.show(ctx, text, [
             [("🔑 Подключение", "connect"), ("💰 Баланс", "balance")],
+            [("🛡 Отключение лотов при низком балансе", "guard")],
             [("📦 Мои лоты", "lots:0"), ("📋 Заказы", "orders:0")],
             [("🩺 Проверка готовности", "diagnostics"), ("📊 Сводка", "summary")],
             [("🟢 Включить автопокупку" if not enabled else "🔴 Остановить автопокупку", "enable" if not enabled else "disable")],
@@ -899,6 +1127,12 @@ class Panel:
                          + "\n\nВведите число штук, которое покупатель выбрал на FunPay. Например: 2.\n"
                          "Это только расчёт: покупка не создаётся и деньги не списываются.",
             "findorder": "🔎 Поиск заказа\n\nОтправьте номер заказа FunPay, например AB123 или #AB123.",
+            "guard_USD": "💵 Порог баланса USD\n\nПри каком остатке снимать Steam и подарки Steam с продажи?\n"
+                         "Введите сумму в USD. Например: 10. При балансе 10 USD или меньше лоты отключатся.\n"
+                         "0 означает отключение только при нулевом балансе.",
+            "guard_TON": "💎 Порог баланса TON\n\nПри каком остатке снимать Stars и Premium с продажи?\n"
+                         "Введите сумму в TON. Например: 2,5. При балансе 2,5 TON или меньше лоты отключатся.\n"
+                         "0 означает отключение только при нулевом балансе.",
             "review": "✅ Проверьте настройки\n\n" + (rule_text(rule) if step == "review" else "") + "\n\nСохранить для новых заказов этого лота?"}
         text = prompts[step]
         if step == "kind":
@@ -975,7 +1209,15 @@ class Panel:
             return
         text, data, step = message.text.strip(), state["data"], state["step"]
         try:
-            if step == "calculate":
+            if step in {"guard_USD", "guard_TON"}:
+                currency = step.split("_")[1]
+                value = str(number(text.replace(",", "."), "порог " + currency, allow_zero=True))
+                cfg = self.e.config.snapshot()
+                cfg["balance_guard"][currency] = value
+                self.e.config.save(cfg)
+                self.guard_menu(ctx, "✅ Порог сохранён. Уже снятые лоты сами не включатся.")
+                self.e.balance_guard.request()
+            elif step == "calculate":
                 units = integer(text, "число штук лота")
                 rule = data["rule"]
                 total = order_quantity(rule, units)
@@ -1141,6 +1383,44 @@ class Panel:
                   [[("📋 Открыть заказы", "orders:0")], [("🔄 Обновить сводку", "summary")],
                    [("⬅️ В главное меню", "home")]])
 
+    def guard_menu(self, ctx, note=""):
+        self.clear(ctx)
+        cfg = self.e.config.snapshot()
+        settings = cfg["balance_guard"]
+        holds = self.e.ledger.holds()
+        text = ("🛡 Отключение лотов при низком балансе\n\n"
+                f"Контроль: {'ВКЛ 🟢' if settings['enabled'] else 'ВЫКЛ 🔴'}\n"
+                f"Steam и подарки: {'≤ ' + str(settings['USD']) + ' USD' if settings.get('USD') is not None else 'порог не задан'}\n"
+                f"Stars и Premium: {'≤ ' + str(settings['TON']) + ' TON' if settings.get('TON') is not None else 'порог не задан'}\n\n"
+                "При достижении порога лоты действительно снимаются с продажи на FunPay. "
+                "Охватываются только лоты, настроенные в этом плагине, включая лоты на паузе.\n\n"
+                "Проверка — примерно раз в минуту и после покупки; при занятости очереди возможна задержка. "
+                "Контроль работает отдельно от переключателя автопокупки. Сам плагин Cardinal должен быть включён.\n")
+        if cfg["dry_run"]:
+            text += "\n🧪 Сейчас тест: покажем срабатывание, но лоты на FunPay не меняем. Для снятия нужен реальный режим.\n"
+        for currency, status in self.e.balance_guard.status.items():
+            ago = max(0, int(time.time() - status["checked"]))
+            value = "ошибка проверки — баланс неизвестен" if status.get("error") else status["balance"] + " " + currency
+            text += f"\nПоследний результат {currency}: {value} ({ago} сек. назад)"
+        if holds:
+            text += "\n\nПод защитой: " + ", ".join("#" + key for key in list(holds)[:15])
+            text += "\nПосле пополнения нажмите «Вернуть лоты»: баланс будет проверен заново."
+        text += "\n\nОшибка API не считается нулевым балансом. Автовосстановление Cardinal блокируется для снятых лотов."
+        if note:
+            text += "\n\n" + note
+        rows = [[("💵 Задать порог USD", "guardset:USD"), ("💎 Задать порог TON", "guardset:TON")],
+                [("🟢 Включить контроль" if not settings["enabled"] else "🔴 Отключить контроль",
+                  "guardon" if not settings["enabled"] else "guardoffask")],
+                [("🔍 Проверить баланс сейчас", "guardcheck")]]
+        if holds:
+            rows.append([("▶️ Вернуть лоты после пополнения", "guardrestoreask")])
+        if settings.get("USD") is not None:
+            rows.append([("Убрать порог USD", "guardclear:USD")])
+        if settings.get("TON") is not None:
+            rows.append([("Убрать порог TON", "guardclear:TON")])
+        rows += [[("🔄 Обновить", "guard")], [("⬅️ В главное меню", "home")]]
+        self.show(ctx, text, rows)
+
     def order(self, ctx, order_id):
         self.clear(ctx)
         row = self.e.ledger.get(order_id)
@@ -1189,6 +1469,60 @@ class Panel:
         cfg = self.e.config.snapshot()
         if action == "home":
             self.home(ctx)
+        elif action == "guard":
+            self.guard_menu(ctx)
+        elif action == "guardset" and arg in {"USD", "TON"}:
+            self.begin(ctx, "guard_" + arg)
+        elif action == "guardclear" and arg in {"USD", "TON"}:
+            self.show(ctx, "Убрать порог " + arg + "?\n\n"
+                      "Для этой валюты контроль и запрет автовосстановления перестанут действовать. "
+                      "Сам плагин лоты не включает, но Cardinal сможет восстановить их.\n"
+                      "История снятия сохранится.",
+                      [[("Да, убрать порог", "guardclearok:" + arg)], [("⬅️ Назад", "guard")]])
+        elif action == "guardclearok" and arg in {"USD", "TON"}:
+            cfg["balance_guard"][arg] = None
+            if all(cfg["balance_guard"].get(key) is None for key in ("USD", "TON")):
+                cfg["balance_guard"]["enabled"] = False
+            self.e.config.save(cfg)
+            self.guard_menu(ctx)
+        elif action == "guardon":
+            if all(cfg["balance_guard"].get(key) is None for key in ("USD", "TON")):
+                raise GGPError("Сначала задайте хотя бы один порог: USD или TON.")
+            if not ((os.environ.get("GGP_USERNAME") or cfg["username"])
+                    and (os.environ.get("GGP_PASSWORD") or cfg["password"])):
+                raise GGPError("Сначала укажите данные GreenGamePay в «Подключении».")
+            cfg["balance_guard"]["enabled"] = True
+            self.e.config.save(cfg)
+            self.e.balance_guard.request()
+            self.guard_menu(ctx, "Проверка поставлена в очередь. Нажмите «Обновить», чтобы увидеть результат.")
+        elif action == "guardoffask":
+            self.show(ctx, "Отключить контроль баланса?\n\nНовые проверки и запрет автовосстановления прекращаются. "
+                      "Сам плагин лоты не включает, но Cardinal сможет восстановить их.",
+                      [[("🔴 Да, отключить", "guardoff")], [("⬅️ Оставить включённым", "guard")]])
+        elif action == "guardoff":
+            cfg["balance_guard"]["enabled"] = False
+            self.e.config.save(cfg)
+            self.guard_menu(ctx)
+        elif action == "guardcheck":
+            if not self.e.balance_guard.enabled():
+                raise GGPError("Сначала включите контроль баланса и сам плагин Cardinal.")
+            self.e.balance_guard.check()
+            self.guard_menu(ctx)
+        elif action == "guardrestoreask":
+            self.show(ctx, "Вернуть снятые лоты в продажу?\n\n"
+                      "Проверим свежий баланс. Он должен быть выше настроенного порога. "
+                      "Включим только лоты, которые этот контроль сам пытался снять с продажи. "
+                      "Лоты, уже выключенные до проверки, останутся выключенными.",
+                      [[("▶️ Проверить баланс и вернуть", "guardrestore")], [("⬅️ Назад", "guard")]])
+        elif action == "guardrestore":
+            restored, released, errors = self.e.balance_guard.restore()
+            note = (f"Возвращено в продажу: {len(restored)}.\n"
+                    f"Снят только запрет, активность не менялась: {len(released)}.")
+            if errors:
+                note += "\n" + "\n".join(errors[:6])
+                if len(errors) > 6:
+                    note += f"\nИ ещё ошибок: {len(errors) - 6}."
+            self.guard_menu(ctx, note)
         elif action == "diagnostics":
             self.diagnostics(ctx)
         elif action == "summary":
@@ -1225,6 +1559,7 @@ class Panel:
                     self.e.paused.set()
             self.e.config.save(cfg)
             self.home(ctx)
+            self.e.balance_guard.request()
         elif action == "live":
             self.clear(ctx)
             self.show(ctx, "💳 Перейти к реальным покупкам?\n\n"
@@ -1405,15 +1740,22 @@ def status_changed(cardinal, event, *args):
         _engine.submit(_engine.status_changed, event)
 
 
+def start(cardinal, *args):
+    if _engine and not _engine.stopped:
+        _engine.balance_guard.start()
+
+
 def stop(*args):
     if _engine:
         _engine.stopped = True
+        _engine.balance_guard.stop()
         _engine.pool.shutdown(wait=False, cancel_futures=True)
         # Keep the instance lock until in-flight work has actually finished.
         threading.Thread(target=_engine.close, name="GGP-shutdown", daemon=True).start()
 
 
 BIND_TO_PRE_INIT = [init]
+BIND_TO_POST_START = [start]
 BIND_TO_NEW_ORDER = [new_order]
 BIND_TO_NEW_MESSAGE = [new_message]
 BIND_TO_ORDER_STATUS_CHANGED = [status_changed]
