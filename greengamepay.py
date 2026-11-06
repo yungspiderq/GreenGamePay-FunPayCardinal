@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import requests
 
 NAME = "GreenGamePay"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = "Steam, Telegram Stars/Premium и подарки Steam через GreenGamePay. /ggp"
 CREDITS = "https://github.com/yungspiderq"
 UUID = "e375b82f-b750-4dbe-bbc0-9731c39acf0a"
@@ -289,6 +289,7 @@ class Engine:
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="GreenGamePay")
         self.stopped = False
         self.paused = threading.Event()
+        self.panel = Panel(self)
 
     def active(self):
         plugin = self.c.plugins.get(UUID)
@@ -423,7 +424,7 @@ class Engine:
                 value = recipient(row["rule"]["kind"], parts[2])
                 nonce = secrets.token_hex(3)
                 self.phase(row, "confirm", recipient=value, nonce=nonce, confirm_until=time.time() + 900)
-                self.tell(row, f"Заказ #{row['id']}: {row['rule']['kind']}, количество {row['quantity']}, "
+                self.tell(row, f"Заказ #{row['id']}: {KIND_NAMES[row['rule']['kind']]}, объём {row['quantity']}, "
                           f"получатель: {value}.\nПодтвердите в течение 15 минут:\n!ggp {row['id']} да {nonce}\n"
                           "Для исправления отправьте команду с новым получателем.")
         except GGPError as exc:
@@ -522,7 +523,8 @@ class Engine:
     def deliver(self, row):
         if row["state"] != "paid":
             return
-        text = (f"#{row['id']}: поставщик подтвердил оплату {row['rule']['kind']} для {row['recipient']}. "
+        text = (f"#{row['id']}: поставщик подтвердил оплату. Услуга: {KIND_NAMES[row['rule']['kind']]}. "
+                f"Получатель: {row['recipient']}. "
                 "Проверьте поступление. Подтверждайте заказ FunPay только после получения товара.")
         if self.tell(row, text):
             self.phase(row, "done", notified=True)
@@ -579,7 +581,7 @@ def telegram_command(engine, message):
         with engine.lock:
             cfg = engine.config.snapshot()
             if command == "/ggp":
-                reply(f"GreenGamePay {VERSION}\nВключён: {cfg['enabled']} | Тест: {cfg['dry_run']}\n" + HELP)
+                engine.panel.open(message)
             elif command == "/ggp_auth":
                 login, sep, password = argument.partition(" ")
                 if not sep or not login or not password:
@@ -649,7 +651,7 @@ def telegram_command(engine, message):
                     engine.process(row)
                     reply("Состояние: " + engine.ledger.get(row["id"])["state"])
                 elif command == "/ggp_redeliver":
-                    if row["state"] not in {"paid", "done"}:
+                    if row["state"] not in {"paid", "done"} or row.get("manual_resolution"):
                         raise GGPError("Нет подтверждённой оплаты.")
                     engine.phase(row, "paid")
                     engine.deliver(row)
@@ -661,6 +663,501 @@ def telegram_command(engine, message):
                     reply("Отметка сохранена. Запросов покупки и возврата не было.")
     except (GGPError, ValueError, TypeError, KeyError) as exc:
         reply(str(exc) if isinstance(exc, GGPError) else "Некорректные параметры или формат ответа. Проверьте инструкцию.")
+
+
+KIND_NAMES = {"steam": "🎮 Пополнение Steam", "stars": "⭐ Telegram Stars",
+              "premium": "💎 Telegram Premium", "gift": "🎁 Подарок Steam"}
+STATE_NAMES = {"waiting": "Ждём получателя", "confirm": "Ждём подтверждения", "ready": "Готов к обработке",
+               "blocked": "Нужно исправить ошибку", "creating": "Создаём заказ", "created": "Создан у поставщика",
+               "paying": "Оплачиваем", "review": "Нужна ручная проверка", "paid": "Оплачен, сообщение не доставлено",
+               "done": "Обработка завершена", "dry_run": "Тест без покупки", "cancelled": "Обработка закрыта"}
+
+
+def rule_text(rule):
+    kind = rule["kind"]
+    unit = rule.get("currency", "USD") if kind == "steam" else {"stars": "Stars", "premium": "мес.", "gift": "игра"}[kind]
+    cost_unit = "USD" if kind in {"steam", "gift"} else "TON"
+    text = (f"{KIND_NAMES[kind]}\nЗа 1 единицу лота: {rule['quantity']} {unit}\n"
+            f"Максимум за заказ: {rule['max_quantity']} {unit}\n"
+            f"Лимит {'котировки' if cost_unit == 'TON' else 'стоимости'}: {rule['max_cost']} {cost_unit}")
+    if kind == "gift":
+        text += f"\nПакет Steam (SUB_ID): {rule['sub_id']} · Регион: {rule['region']}"
+    return text
+
+
+class Panel:
+    """One active inline panel and one expiring wizard per private administrator chat."""
+    def __init__(self, engine):
+        self.e = engine
+        self.sessions = {}
+        self.pending = {}
+
+    @staticmethod
+    def key(ctx):
+        return ctx["chat"], ctx["user"]
+
+    @staticmethod
+    def context(message, user=None, edit=False):
+        return {"chat": message.chat.id, "user": user or message.from_user.id,
+                "mid": message.id if edit else None}
+
+    def clear(self, ctx):
+        self.pending.pop(self.key(ctx), None)
+        tg = self.e.c.telegram
+        if hasattr(tg, "clear_state"):
+            state = tg.get_state(ctx["chat"], ctx["user"])
+            if state and state.get("state") == "ggp_input":
+                tg.clear_state(ctx["chat"], ctx["user"])
+
+    def show(self, ctx, text, rows):
+        from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+        token = secrets.token_hex(4)
+        keyboard = InlineKeyboardMarkup()
+        for row in rows:
+            buttons = []
+            for title, action in row:
+                data = action[1:] if action.startswith("=") else f"ggp:{token}:{action}"
+                if len(data.encode("utf8")) > 64:
+                    raise GGPError("Слишком длинный идентификатор кнопки.")
+                buttons.append(InlineKeyboardButton(title, callback_data=data))
+            keyboard.row(*buttons)
+        title, _, body = text.partition("\n")
+        rendered = "<b>" + html.escape(title) + "</b>\n" + html.escape(body)
+        bot = self.e.c.telegram.bot
+        if ctx.get("mid"):
+            try:
+                bot.edit_message_text(rendered, ctx["chat"], ctx["mid"], reply_markup=keyboard)
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    sent = bot.send_message(ctx["chat"], rendered, reply_markup=keyboard)
+                    ctx["mid"] = sent.message_id
+        else:
+            sent = bot.send_message(ctx["chat"], rendered, reply_markup=keyboard)
+            ctx["mid"] = sent.message_id
+        self.sessions[self.key(ctx)] = {"token": token, "mid": ctx["mid"]}
+
+    def home(self, ctx, note=""):
+        from tg_bot import CBT
+        self.clear(ctx)
+        cfg = self.e.config.snapshot()
+        connected = bool((os.environ.get("GGP_USERNAME") or cfg["username"])
+                         and (os.environ.get("GGP_PASSWORD") or cfg["password"]))
+        enabled = cfg["enabled"] and not self.e.paused.is_set()
+        text = (f"🌿 GreenGamePay v{VERSION}\n\n"
+                f"Автопокупка: {'ВКЛ 🟢' if enabled else 'ВЫКЛ 🔴'}\n"
+                f"Режим: {'🧪 Тест — деньги не списываются' if cfg['dry_run'] else '💳 Реальные покупки'}\n"
+                f"Подключение: {'данные указаны' if connected else 'не настроено'}\n"
+                f"Настроено лотов: {len(cfg['lots'])}\n\n"
+                "Как начать:\n1. Подключите GreenGamePay.\n2. Выберите лоты и настройте товар.\n"
+                "3. Включите автопокупку. Сначала проверьте тестовый режим.\n\n"
+                "Покупатель указывает получателя и подтверждает его в чате FunPay.")
+        plugin = self.e.c.plugins.get(UUID)
+        if not plugin or not plugin.enabled:
+            text += "\n\n⏸ Плагин отключён в Cardinal. Включите его в карточке плагина."
+        if note:
+            text += "\n\n" + note
+        self.show(ctx, text, [
+            [("🔑 Подключение", "connect"), ("💰 Баланс", "balance")],
+            [("📦 Мои лоты", "lots:0"), ("📋 Заказы", "orders:0")],
+            [("🟢 Включить автопокупку" if not enabled else "🔴 Остановить автопокупку", "enable" if not enabled else "disable")],
+            [("✅ 🧪 Тестовый режим" if cfg["dry_run"] else "⬜ 🧪 Тестовый режим", "live" if cfg["dry_run"] else "test")],
+            [("📚 Каталог поставщика", "catalog:0")],
+            [("❓ Как это работает", "help")],
+            [("🔄 Обновить меню", "home")],
+            [("⬅️ Назад к плагину", f"={CBT.EDIT_PLUGIN}:{UUID}:0")]])
+
+    def open(self, message):
+        if authorized(self.e.c, message):
+            self.home(self.context(message))
+
+    def lots(self, ctx, page=0):
+        self.clear(ctx)
+        cfg = self.e.config.snapshot()
+        items = list(self.e.c.profile.get_sorted_lots(1).items())
+        # Include removed lots so stale rules can still be inspected and unbound.
+        known = {str(key) for key, _ in items}
+        items += [(int(key), None) for key in cfg["lots"] if key not in known]
+        page = max(0, min(page, max(0, (len(items) - 1) // 6)))
+        rows = []
+        for lot_id, lot in items[page * 6:page * 6 + 6]:
+            label = ("✅ " if str(lot_id) in cfg["lots"] else "⬜ ") + f"#{lot_id} · "
+            label += (lot.description or "Без названия")[:34] if lot else "Лот удалён с FunPay"
+            rows.append([(label, f"lot:{lot_id}")])
+        self.pager(rows, "lots", page, len(items), 6)
+        rows.append([("⬅️ В главное меню", "home")])
+        self.show(ctx, "📦 Мои лоты\n\nВыберите лот для настройки.\n✅ — настроен; ⬜ — ещё не настроен.\n"
+                  "Настройки применяются только к новым заказам.\n\n"
+                  + (f"Страница {page + 1}" if items else "Лотов пока нет. Добавьте лот на FunPay и обновите профиль Cardinal."), rows)
+
+    @staticmethod
+    def pager(rows, name, page, count, size):
+        nav = []
+        if page:
+            nav.append(("⬅️", f"{name}:{page - 1}"))
+        if (page + 1) * size < count:
+            nav.append(("➡️", f"{name}:{page + 1}"))
+        if nav:
+            rows.append(nav)
+
+    def lot(self, ctx, lot_id):
+        self.clear(ctx)
+        rule = self.e.config.snapshot()["lots"].get(lot_id)
+        lot = self.e.c.profile.get_sorted_lots(1).get(int(lot_id))
+        text = f"📦 Лот #{lot_id}\n\n" + ((lot.description or "Без названия")[:700] if lot else "Лот больше не найден на FunPay.")
+        text += "\n\n" + (rule_text(rule) if rule else "Этот лот пока не подключён к GreenGamePay.")
+        text += "\n\nОтключите для него стандартную автовыдачу Cardinal и другие плагины выдачи."
+        rows = []
+        if lot:
+            rows.append([("⚙️ Изменить настройки" if rule else "➕ Настроить лот", f"setup:{lot_id}")])
+        if rule:
+            rows.append([("🗑 Отключить этот лот", f"unask:{lot_id}")])
+        rows += [[("⬅️ К списку лотов", "lots:0")]]
+        self.show(ctx, text, rows)
+
+    def begin(self, ctx, step, **data):
+        tg = self.e.c.telegram
+        if hasattr(tg, "set_state"):
+            tg.set_state(ctx["chat"], ctx.get("mid") or 0, ctx["user"], "ggp_input")
+        self.pending[self.key(ctx)] = {"step": step, "expires": time.time() + 900, "data": data}
+        self.prompt(ctx)
+
+    def prompt(self, ctx, error=""):
+        state = self.pending[self.key(ctx)]
+        step, data = state["step"], state["data"]
+        rule = data.get("rule", {})
+        rows = []
+        prompts = {
+            "login": "🔑 Подключение · шаг 1 из 2\n\nОтправьте логин вашего аккаунта GreenGamePay (пополнистим.рф).",
+            "password": "🔑 Подключение · шаг 2 из 2\n\nОтправьте пароль GreenGamePay отдельным сообщением.\n"
+                        "Бот попробует удалить это сообщение. Данные сохраняются только на сервере Cardinal.",
+            "kind": "📦 Настройка лота\n\nКакой товар получает покупатель?",
+            "currency": "🎮 Валюта пополнения Steam\n\nВ какой валюте указан номинал вашего лота?\nЭто валюта пополнения, а не цена продажи на FunPay.",
+            "quantity": "📏 Объём товара\n\nСколько получает покупатель за 1 единицу лота?\n",
+            "max_quantity": "📏 Максимум за заказ\n\nУкажите максимальный общий объём одного заказа.\n"
+                            "Например: 50 Stars за единицу × 4 единицы = 200 Stars. Для такого заказа максимум должен быть не меньше 200.",
+            "max_cost": "💰 Лимит стоимости\n\n",
+            "sub_id": "🎁 Пакет игры Steam\n\nОтправьте SUB_ID пакета игры. Это ID пакета, а не APP_ID приложения.",
+            "region": "🌍 Регион получателя\n\nДля какого региона аккаунта продаётся подарок?",
+            "review": "✅ Проверьте настройки\n\n" + (rule_text(rule) if step == "review" else "") + "\n\nСохранить для новых заказов этого лота?"}
+        text = prompts[step]
+        if step == "kind":
+            rows = [[(title, "kind:" + kind)] for kind, title in KIND_NAMES.items()]
+        elif step == "currency":
+            rows = [[(value, "currency:" + value) for value in ("USD", "RUB")],
+                    [(value, "currency:" + value) for value in ("KZT", "UAH")]]
+        elif step == "region":
+            rows = [[(value, "region:" + value) for value in ("RU", "UA", "KZ")]]
+        elif step == "quantity":
+            kind = rule["kind"]
+            if kind == "premium":
+                text += "Выберите длительность подписки. Один заказ FunPay — одна подписка."
+                rows = [[(value + " мес.", "months:" + value) for value in ("3", "6", "12")]]
+            else:
+                text += (f"Отправьте сумму пополнения в {rule.get('currency', 'USD')}. Например: 100."
+                         if kind == "steam" else "Отправьте целое число Stars, минимум 50. Например: 50.")
+        elif step == "max_quantity":
+            text = text.split("Например:")[0] + "\nСейчас за 1 единицу: " + rule["quantity"] + "\n"
+            text += "Введите верхний предел в тех же единицах. Он должен быть не меньше объёма за 1 единицу."
+        elif step == "max_cost":
+            text += ("Укажите максимум в USD на весь заказ. Например: 10. Проверяем стоимость до оплаты."
+                     if rule["kind"] in {"steam", "gift"} else
+                     "Укажите максимум котировки в TON на весь заказ. Например: 5.\n"
+                     "Окончательное списание может быть выше из-за комиссии или изменения курса.")
+        elif step == "review":
+            rows = [[("💾 Сохранить настройки", "save")]]
+        if error:
+            text += "\n\n⚠️ " + error
+        rows += [[("✖️ Отмена", "home")]]
+        self.show(ctx, text, rows)
+
+    def next_step(self, ctx, step):
+        self.pending[self.key(ctx)]["step"] = step
+        self.pending[self.key(ctx)]["expires"] = time.time() + 900
+        self.prompt(ctx)
+
+    def has_input(self, message):
+        if not authorized(self.e.c, message) or not getattr(message, "text", None) or message.text.startswith("/"):
+            return False
+        key = message.chat.id, message.from_user.id
+        if key not in self.pending:
+            return False
+        tg = self.e.c.telegram
+        if hasattr(tg, "get_state"):
+            state = tg.get_state(*key)
+            if not state or state.get("state") != "ggp_input":
+                self.pending.pop(key, None)
+                return False
+        return True
+
+    def input(self, message):
+        if not self.has_input(message):
+            return
+        ctx = self.context(message)
+        ctx["mid"] = self.sessions.get(self.key(ctx), {}).get("mid")
+        state = self.pending[self.key(ctx)]
+        secret_step = state["step"] == "password"
+        deleted = False
+        if secret_step:
+            try:
+                self.e.c.telegram.bot.delete_message(message.chat.id, message.id)
+                deleted = True
+            except Exception:
+                pass
+        if time.time() > state["expires"]:
+            self.home(ctx, "⌛ Время ввода истекло. Начните настройку заново.")
+            return
+        text, data, step = message.text.strip(), state["data"], state["step"]
+        try:
+            if step == "login":
+                if not text or len(text) > 200 or "\n" in text:
+                    raise GGPError("Отправьте логин одной строкой.")
+                data["login"] = text
+                self.next_step(ctx, "password")
+            elif step == "password":
+                if not message.text or len(message.text) > 1000:
+                    raise GGPError("Пароль должен содержать от 1 до 1000 символов.")
+                cfg = self.e.config.snapshot()
+                cfg.update(username=data["login"], password=message.text)
+                self.e.config.save(cfg)
+                note = "✅ Данные сохранены. Нажмите «Баланс», чтобы проверить подключение."
+                if not deleted:
+                    note += "\nСообщение с паролем не удалось удалить — удалите его вручную."
+                self.home(ctx, note)
+            elif step in {"quantity", "max_quantity", "max_cost", "sub_id"}:
+                rule = data["rule"]
+                value = str(number(text.replace(",", "."), "значение"))
+                if step == "quantity" and rule["kind"] == "premium":
+                    raise GGPError("Выберите 3, 6 или 12 месяцев кнопкой ниже.")
+                if step == "quantity" and rule["kind"] == "stars" and integer(value) < 50:
+                    raise GGPError("Минимум 50 Stars за единицу.")
+                if step == "max_quantity" and number(value) < number(rule["quantity"]):
+                    raise GGPError("Максимум не может быть меньше объёма за одну единицу.")
+                rule[step] = integer(value, "SUB_ID") if step == "sub_id" else value
+                next_step = {"quantity": "max_quantity", "max_quantity": "max_cost", "sub_id": "region", "max_cost": "review"}[step]
+                if next_step == "review":
+                    data["rule"] = validate_rule(rule)
+                self.next_step(ctx, next_step)
+            else:
+                raise GGPError("На этом шаге выберите вариант кнопкой ниже.")
+        except GGPError as exc:
+            self.prompt(ctx, str(exc))
+
+    def wizard_action(self, ctx, action, arg):
+        state = self.pending.get(self.key(ctx))
+        required = {"kind": "kind", "currency": "currency", "months": "quantity", "region": "region", "save": "review"}
+        if not state or time.time() > state["expires"] or state["step"] != required[action]:
+            self.home(ctx, "⌛ Этот шаг уже закрыт. Начните настройку лота заново.")
+            return
+        data = state["data"]
+        rule = data["rule"]
+        if action == "kind" and arg in KINDS:
+            rule["kind"] = arg
+            if arg == "gift":
+                rule.update(quantity="1", max_quantity="1")
+                self.next_step(ctx, "sub_id")
+            else:
+                self.next_step(ctx, "currency" if arg == "steam" else "quantity")
+        elif action == "currency" and arg in {"USD", "RUB", "KZT", "UAH"}:
+            rule["currency"] = arg
+            self.next_step(ctx, "quantity")
+        elif action == "months" and rule["kind"] == "premium" and arg in {"3", "6", "12"}:
+            rule.update(quantity=arg, max_quantity=arg)
+            self.next_step(ctx, "max_cost")
+        elif action == "region" and arg in {"RU", "UA", "KZ"}:
+            rule["region"] = arg
+            self.next_step(ctx, "max_cost")
+        elif action == "save":
+            cfg = self.e.config.snapshot()
+            if int(data["lot_id"]) not in self.e.c.profile.get_sorted_lots(1):
+                raise GGPError("Лот больше не найден на FunPay. Обновите профиль Cardinal.")
+            cfg["lots"][data["lot_id"]] = validate_rule(rule)
+            self.e.config.save(cfg)
+            self.lot(ctx, data["lot_id"])
+
+    def orders(self, ctx, page=0):
+        self.clear(ctx)
+        orders = self.e.ledger.recent(100)
+        page = max(0, min(page, max(0, (len(orders) - 1) // 6)))
+        rows = [[(f"#{row['id']} · {STATE_NAMES.get(row['state'], row['state'])}", "order:" + row["id"])]
+                for row in orders[page * 6:page * 6 + 6]]
+        self.pager(rows, "orders", page, len(orders), 6)
+        rows += [[("🔄 Обновить список", f"orders:{page}")], [("⬅️ В главное меню", "home")]]
+        self.show(ctx, "📋 Заказы\n\n" + ("Выберите заказ, чтобы посмотреть статус и доступные действия.\n"
+                  "Журнал сохраняется после перезапуска." if orders else "Заказов ещё нет. Здесь появятся покупки настроенных лотов."), rows)
+
+    def order(self, ctx, order_id):
+        self.clear(ctx)
+        row = self.e.ledger.get(order_id)
+        if not row:
+            raise GGPError("Заказ не найден.")
+        text = (f"📋 Заказ #{row['id']}\n\n{KIND_NAMES[row['rule']['kind']]}\n"
+                f"Статус: {STATE_NAMES.get(row['state'], row['state'])}\n"
+                f"Получатель: {row.get('recipient') or 'ещё не указан'}\nОбъём: {row['quantity']}\n"
+                f"Лот: #{row['lot_id']}")
+        if row.get("error"):
+            text += "\n\nЧто случилось: " + row["error"][:500]
+        if row["state"] in {"review", "created"}:
+            text += "\n\nПроверьте списание и доставку у GreenGamePay. Повтор оплаты заблокирован.\nID поставщика: " + row["custom_id"]
+        if row.get("manual_resolution"):
+            text += "\n\nПродавец закрыл запись вручную. Это не подтверждение оплаты от API."
+        rows = []
+        if row["state"] in {"blocked", "ready"}:
+            rows.append([("▶️ Возобновить обработку", "resumeask:" + order_id)])
+        if row["state"] in {"paid", "done"} and not row.get("manual_resolution"):
+            rows.append([("💬 Повторить сообщение", "redeliver:" + order_id)])
+        if row["state"] not in IN_FLIGHT | {"done", "cancelled"}:
+            rows.append([("✍️ Закрыть запись вручную", "resolveask:" + order_id)])
+        rows += [[("🔄 Обновить статус", "order:" + order_id)], [("⬅️ К заказам", "orders:0")]]
+        self.show(ctx, text, rows)
+
+    def callback(self, call):
+        if (not getattr(call, "message", None) or not getattr(call, "from_user", None)
+                or call.from_user.id not in self.e.c.telegram.authorized_users
+                or call.message.chat.type != "private"):
+            return
+        ctx = self.context(call.message, call.from_user.id, edit=True)
+        parts = call.data.split(":", 3)
+        session = self.sessions.get(self.key(ctx), {})
+        if (len(parts) < 3 or parts[1] != session.get("token") or ctx["mid"] != session.get("mid")):
+            self.e.c.telegram.bot.send_message(ctx["chat"], "Это старое меню. Откройте актуальное командой /ggp.")
+            return
+        action, arg = parts[2], parts[3] if len(parts) == 4 else ""
+        try:
+            self.route(ctx, action, arg, call)
+        except (GGPError, ValueError, TypeError, KeyError) as exc:
+            text = str(exc) if isinstance(exc, GGPError) else "Не удалось обработать ответ. Обновите меню и попробуйте ещё раз."
+            self.show(ctx, "⚠️ Не удалось выполнить действие\n\n" + text,
+                      [[("⬅️ В главное меню", "home")]])
+
+    def route(self, ctx, action, arg, call):
+        cfg = self.e.config.snapshot()
+        if action == "home":
+            self.home(ctx)
+        elif action in {"enable", "disable", "test", "live_yes"}:
+            self.clear(ctx)
+            if action == "enable" and self.e.c.old_mode_enabled:
+                raise GGPError("В настройках Cardinal отключите старый режим получения сообщений (oldMsgGetMode).")
+            if action == "live_yes":
+                if not cfg["lots"] or not ((os.environ.get("GGP_USERNAME") or cfg["username"])
+                                           and (os.environ.get("GGP_PASSWORD") or cfg["password"])):
+                    raise GGPError("Сначала подключите GreenGamePay и настройте хотя бы один лот.")
+                cfg["dry_run"] = False
+            elif action == "test":
+                cfg["dry_run"] = True
+            else:
+                cfg["enabled"] = action == "enable"
+                if action == "enable":
+                    self.e.paused.clear()
+                else:
+                    self.e.paused.set()
+            self.e.config.save(cfg)
+            self.home(ctx)
+        elif action == "live":
+            self.clear(ctx)
+            self.show(ctx, "💳 Перейти к реальным покупкам?\n\n"
+                      "После подтверждения покупателем плагин будет оплачивать товар с вашего баланса GreenGamePay.\n"
+                      "Проверьте привязки лотов и лимиты.\n\n"
+                      "Уже завершённые тестовые заказы останутся тестовыми.",
+                      [[("💳 Да, включить реальные покупки", "live_yes")], [("🧪 Оставить тестовый режим", "home")]])
+        elif action == "connect":
+            self.clear(ctx)
+            external = bool(os.environ.get("GGP_USERNAME") or os.environ.get("GGP_PASSWORD"))
+            text = "🔑 Подключение GreenGamePay\n\nНужны логин и пароль от пополнистим.рф. GitHub-токен здесь не используется.\n"
+            text += ("\nДанные заданы через переменные окружения сервера. Меняйте их на сервере и перезапускайте Cardinal."
+                     if external else "\nНажмите кнопку ниже: бот по очереди запросит логин и пароль.")
+            rows = [] if external else [[("✏️ Ввести логин и пароль", "auth")]]
+            rows += [[("🔍 Проверить подключение и баланс", "balance")], [("⬅️ В главное меню", "home")]]
+            self.show(ctx, text, rows)
+        elif action == "auth":
+            self.begin(ctx, "login")
+        elif action == "balance":
+            self.clear(ctx)
+            usd = number(self.e.api.call("check_balance"), "баланс USD", allow_zero=True)
+            ton = number(self.e.api.call("get_ton_balance"), "баланс TON", allow_zero=True)
+            self.show(ctx, f"💰 Баланс GreenGamePay\n\n✅ Подключение работает\n\n💵 {usd} USD — Steam и подарки Steam\n"
+                      f"💎 {ton} TON — Stars и Premium\n\nПополнение баланса выполняется на стороне GreenGamePay.",
+                      [[("🔄 Обновить баланс", "balance")], [("⬅️ В главное меню", "home")]])
+        elif action == "lots":
+            self.lots(ctx, int(arg))
+        elif action == "lot":
+            self.lot(ctx, str(integer(arg, "ID лота")))
+        elif action == "setup":
+            lot_id = str(integer(arg, "ID лота"))
+            if int(lot_id) not in self.e.c.profile.get_sorted_lots(1):
+                raise GGPError("Лот не найден. Обновите профиль Cardinal.")
+            self.begin(ctx, "kind", lot_id=lot_id, rule={})
+        elif action in {"kind", "currency", "months", "region", "save"}:
+            self.wizard_action(ctx, action, arg)
+        elif action == "unask":
+            self.show(ctx, "🗑 Отключить лот?\n\nНовые заказы этого лота не будут обрабатываться GreenGamePay.\n"
+                      "Существующие заказы сохранят прежние настройки.",
+                      [[("🗑 Да, отключить лот", "unbind:" + arg)], [("⬅️ Оставить подключённым", "lot:" + arg)]])
+        elif action == "unbind":
+            cfg["lots"].pop(str(integer(arg)), None)
+            self.e.config.save(cfg)
+            self.lot(ctx, arg)
+        elif action == "orders":
+            self.orders(ctx, int(arg))
+        elif action == "order":
+            self.order(ctx, arg)
+        elif action == "resumeask":
+            self.show(ctx, "▶️ Возобновить обработку?\n\nВ тестовом режиме будет выполнен тест. "
+                      "В реальном режиме возможна покупка с баланса GreenGamePay.\n"
+                      "Продолжение разрешено только для заказов, по которым запрос создания/оплаты ещё не отправлялся.",
+                      [[("▶️ Продолжить", "resume:" + arg)], [("⬅️ Назад к заказу", "order:" + arg)]])
+        elif action == "resume":
+            row = self.e.ledger.get(arg)
+            if not row or row["state"] not in {"blocked", "ready"} or not self.e.active():
+                raise GGPError("Этот заказ нельзя возобновить, либо автопокупка выключена.")
+            self.e.phase(row, "ready")
+            self.e.process(row)
+            self.order(ctx, arg)
+        elif action == "redeliver":
+            row = self.e.ledger.get(arg)
+            if not row or row["state"] not in {"paid", "done"} or row.get("manual_resolution"):
+                raise GGPError("Нет подтверждённой оплаты поставщика.")
+            self.e.phase(row, "paid")
+            self.e.deliver(row)
+            self.order(ctx, arg)
+        elif action == "resolveask":
+            self.show(ctx, "✍️ Ручное закрытие записи\n\nИспользуйте только после проверки у поставщика.\n"
+                      "Эти кнопки меняют запись в журнале. Они не покупают товар, не возвращают деньги и не закрывают заказ FunPay.",
+                      [[("✅ Доставка проверена — завершить", "finish:" + arg)],
+                       [("🚫 Закрыть без отметки о доставке", "cancelorder:" + arg)],
+                       [("⬅️ Назад к заказу", "order:" + arg)]])
+        elif action in {"finish", "cancelorder"}:
+            row = self.e.ledger.get(arg)
+            if not row or row["state"] in IN_FLIGHT | {"done", "cancelled"}:
+                raise GGPError("Запись уже закрыта или запрос ещё выполняется.")
+            self.e.phase(row, "done" if action == "finish" else "cancelled",
+                         manual_resolution=True, resolved_by=ctx["user"])
+            self.order(ctx, arg)
+        elif action == "catalog":
+            self.clear(ctx)
+            catalog = self.e.api.call("get_all_services")
+            items = [item for cat in catalog.get("categories", []) for item in cat.get("services", [])]
+            page = max(0, min(int(arg), max(0, (len(items) - 1) // 6)))
+            lines = [f"• {str(item.get('service_name', 'Товар'))[:180]}\n"
+                     f"  {item.get('price')} {item.get('currency')} · остаток {item.get('in_stock')}"
+                     for item in items[page * 6:page * 6 + 6]]
+            rows = []
+            self.pager(rows, "catalog", page, len(items), 6)
+            rows.append([("⬅️ В главное меню", "home")])
+            self.show(ctx, "📚 Каталог поставщика\n\n" + ("\n\n".join(lines) or "Каталог пуст.")
+                      + "\n\nКаталог справочный. Плагин автоматизирует Steam, Stars, Premium и подарки Steam; подарочные коды не выдаёт.", rows)
+        elif action == "help":
+            self.clear(ctx)
+            self.show(ctx, "❓ Как это работает\n\n"
+                      "1️⃣ Подключение: введите данные GreenGamePay и проверьте баланс.\n\n"
+                      "2️⃣ Мои лоты: выберите товар FunPay, тип услуги, объём и лимит. Отключите стандартную автовыдачу для этого лота.\n\n"
+                      "3️⃣ Тестовый режим: покупатель проходит сценарий, но GreenGamePay не получает запрос покупки.\n\n"
+                      "4️⃣ Реальные покупки: выключите тестовый режим и включите автопокупку. Покупатель указывает и подтверждает получателя.\n\n"
+                      "Объём за заказ = объём за 1 единицу × число купленных единиц. Цена продажи FunPay не определяет объём.\n\n"
+                      "Если статус «Нужна ручная проверка», сначала проверьте списание у поставщика. "
+                      "Повторная оплата автоматически не выполняется. Журнал заказов не очищается, чтобы избежать повторных покупок.\n\n"
+                      "Для Stars/Premium лимит относится к котировке, итог может включать комиссию. "
+                      "Если цена Premium пришла в неизвестном формате, покупка остановится.",
+                      [[("🚀 Открыть подключение", "connect")], [("📦 Настроить лоты", "lots:0")], [("⬅️ В главное меню", "home")]])
 
 
 _engine = None
@@ -686,6 +1183,7 @@ def init(cardinal, *args):
                 # Stop new payment stages immediately, even while another API request is running.
                 if (message.text or "").split()[0].split("@")[0].lower() == "/ggp_off":
                     _engine.paused.set()
+                _engine.panel.clear(_engine.panel.context(message))
                 _engine.submit(telegram_command, _engine, message)
 
         cardinal.telegram.msg_handler(command, commands=commands)
@@ -696,9 +1194,25 @@ def init(cardinal, *args):
                     or not call.message or call.message.chat.type != "private"):
                 return
             cardinal.telegram.bot.answer_callback_query(call.id)
-            cardinal.telegram.bot.send_message(call.message.chat.id, html.escape(HELP))
+            _engine.submit(_engine.panel.home, _engine.panel.context(call.message, call.from_user.id, edit=True))
 
-        cardinal.telegram.cbq_handler(settings, lambda call: call.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"))
+        def panel_callback(call):
+            if (not call.message or not call.from_user or call.from_user.id not in cardinal.telegram.authorized_users
+                    or call.message.chat.type != "private"):
+                return
+            cardinal.telegram.bot.answer_callback_query(call.id)
+            # Apply emergency pause before waiting for the serialized worker, but only for a current button.
+            parts = call.data.split(":", 3)
+            session = _engine.panel.sessions.get((call.message.chat.id, call.from_user.id), {})
+            if (len(parts) == 3 and parts[2] == "disable" and parts[1] == session.get("token")
+                    and call.message.id == session.get("mid")):
+                _engine.paused.set()
+            _engine.submit(_engine.panel.callback, call)
+
+        cardinal.telegram.cbq_handler(settings, lambda call: bool(call.data) and call.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"))
+        cardinal.telegram.cbq_handler(panel_callback, lambda call: bool(call.data) and call.data.startswith("ggp:"))
+        cardinal.telegram.msg_handler(lambda message: _engine.submit(_engine.panel.input, message),
+                                      func=_engine.panel.has_input, content_types=["text"])
     LOG.info("GreenGamePay %s initialized", VERSION)
 
 

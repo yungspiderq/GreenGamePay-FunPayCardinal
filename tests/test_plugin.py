@@ -408,3 +408,244 @@ def test_json_contains_no_auth_in_order(env):
     prepare(env)
     row = json.dumps(env[0].ledger.get("AB123"))
     assert "password" not in row and "access_token" not in row
+
+
+class PanelDriver:
+    def __init__(self, engine):
+        self.engine = engine
+        self.panel = engine.panel
+        self.bot = engine.c.telegram.bot
+        self.bot.send_message.return_value = NS(message_id=100)
+        self.bot.edit_message_text = Mock()
+        self.bot.answer_callback_query = Mock()
+        self.message = NS(id=100, chat=NS(id=7, type="private"), from_user=NS(id=7), text="/ggp")
+        self.states = {}
+        tg = engine.c.telegram
+        tg.get_state = lambda chat, user: self.states.get((chat, user))
+        tg.set_state = lambda chat, mid, user, state: self.states.update({(chat, user): {"state": state}})
+        tg.clear_state = lambda chat, user: self.states.pop((chat, user), None)
+        self.panel.open(self.message)
+
+    @property
+    def view(self):
+        # All screens after the first edit the same message.
+        return self.bot.edit_message_text.call_args or self.bot.send_message.call_args
+
+    @property
+    def text(self):
+        return self.view.args[0] if self.bot.edit_message_text.call_args else self.view.args[1]
+
+    @property
+    def buttons(self):
+        return [button for row in self.view.kwargs["reply_markup"].keyboard for button in row]
+
+    def data(self, action):
+        return next(button.callback_data for button in self.buttons if button.callback_data.split(":", 2)[-1] == action)
+
+    def click(self, action=None, data=None, user=7, chat=7, chat_type="private"):
+        self.panel.callback(NS(id="cb", data=data or self.data(action), from_user=NS(id=user),
+                               message=NS(id=100, chat=NS(id=chat, type=chat_type))))
+
+    def type(self, text):
+        self.panel.input(NS(id=200, chat=self.message.chat, from_user=self.message.from_user, text=text))
+
+
+@pytest.fixture
+def ui(env, monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "tg_bot", NS(CBT=NS(EDIT_PLUGIN="45")))
+    return PanelDriver(env[0])
+
+
+def test_panel_home_has_status_and_native_plugin_back(ui):
+    assert "Автопокупка:" in ui.text
+    assert "Подключение:" in ui.text
+    assert any(button.text == "⬅️ Назад к плагину" and button.callback_data == f"45:{g.UUID}:0" for button in ui.buttons)
+    assert all(len(button.callback_data.encode()) <= 64 for button in ui.buttons)
+
+
+@pytest.mark.parametrize("kind,inputs", [
+    ("steam", [("currency:RUB", None), (None, "100"), (None, "500"), (None, "10")]),
+    ("stars", [(None, "50"), (None, "500"), (None, "5")]),
+    ("premium", [("months:6", None), (None, "20")]),
+    ("gift", [(None, "505826"), ("region:KZ", None), (None, "40")])])
+def test_button_wizard_saves_all_service_types(ui, kind, inputs):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("setup:123")
+    ui.click("kind:" + kind)
+    for button, text in inputs:
+        ui.click(button) if button else ui.type(text)
+    assert "Проверьте настройки" in ui.text
+    assert ui.engine.config.snapshot()["lots"]["123"]["kind"] == "steam"  # no premature save
+    ui.click("save")
+    assert ui.engine.config.snapshot()["lots"]["123"]["kind"] == kind
+    assert not ui.panel.pending
+    assert not ui.states
+
+
+def test_wizard_validation_and_decimal_comma(ui):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("setup:123")
+    ui.click("kind:stars")
+    ui.type("10")
+    assert "Минимум 50" in ui.text
+    ui.type("50.5")
+    assert "целым" in ui.text
+    ui.type("50")
+    ui.type("49")
+    assert "не может быть меньше" in ui.text
+    ui.type("100")
+    ui.type("1,5")
+    ui.click("save")
+    assert ui.engine.config.snapshot()["lots"]["123"]["max_cost"] == "1.5"
+
+
+def test_wizard_cancel_keeps_existing_rule(ui):
+    before = ui.engine.config.snapshot()
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("setup:123")
+    ui.click("kind:premium")
+    ui.click("home")
+    ui.type("12")
+    assert ui.engine.config.snapshot() == before
+    assert not ui.panel.pending and not ui.states
+
+
+def test_auth_wizard_deletes_password_without_echo(ui):
+    ui.click("connect")
+    ui.click("auth")
+    ui.type("ggp-user")
+    ui.type("totally-secret-pass")
+    cfg = ui.engine.config.snapshot()
+    assert cfg["username"] == "ggp-user" and cfg["password"] == "totally-secret-pass"
+    ui.bot.delete_message.assert_called_with(7, 200)
+    assert "totally-secret-pass" not in str(ui.bot.send_message.call_args_list)
+    assert "totally-secret-pass" not in str(ui.bot.edit_message_text.call_args_list)
+    assert "данные указаны" in ui.text
+
+
+def test_expired_password_step_still_deletes_secret(ui):
+    ui.click("connect")
+    ui.click("auth")
+    ui.type("login")
+    ui.panel.pending[(7, 7)]["expires"] = 0
+    ui.type("secret")
+    ui.bot.delete_message.assert_called_with(7, 200)
+    assert not ui.engine.config.snapshot()["password"]
+    assert "Время ввода истекло" in ui.text
+
+
+def test_stale_callback_cannot_change_settings(ui):
+    stale = ui.data("disable")
+    ui.click("home")
+    before = ui.engine.config.snapshot()
+    ui.click(data=stale)
+    assert ui.engine.config.snapshot() == before
+    assert not ui.engine.paused.is_set()
+
+
+@pytest.mark.parametrize("user,chat,chat_type", [(8, 7, "private"), (7, 7, "group"), (7, 10, "private")])
+def test_panel_rejects_unauthorized_or_wrong_context(ui, user, chat, chat_type):
+    before = ui.engine.config.snapshot()
+    ui.click("disable", user=user, chat=chat, chat_type=chat_type)
+    assert ui.engine.config.snapshot() == before
+
+
+def test_live_mode_requires_explicit_confirmation(ui):
+    cfg = ui.engine.config.snapshot()
+    cfg.update(dry_run=True, username="u", password="p")
+    ui.engine.config.save(cfg)
+    ui.click("home")
+    ui.click("live")
+    assert ui.engine.config.snapshot()["dry_run"]
+    ui.click("live_yes")
+    assert ui.engine.config.snapshot()["dry_run"] is False
+
+
+def test_live_mode_without_credentials_stays_test(ui):
+    cfg = ui.engine.config.snapshot()
+    cfg["dry_run"] = True
+    ui.engine.config.save(cfg)
+    ui.click("home")
+    ui.click("live")
+    ui.click("live_yes")
+    assert ui.engine.config.snapshot()["dry_run"] is True
+    assert "Сначала подключите" in ui.text
+
+
+def test_disable_and_enable_are_idempotent(ui):
+    ui.click("disable")
+    assert not ui.engine.active()
+    ui.click("enable")
+    assert ui.engine.active()
+
+
+def test_unbind_requires_confirmation(ui):
+    ui.click("lots:0")
+    ui.click("lot:123")
+    ui.click("unask:123")
+    assert "123" in ui.engine.config.snapshot()["lots"]
+    ui.click("unbind:123")
+    assert "123" not in ui.engine.config.snapshot()["lots"]
+
+
+def test_orders_show_russian_status_and_review_has_no_payment_button(ui, env):
+    msg = prepare(env)
+    env[3].fail = "pay_order"
+    env[0].message(msg)
+    ui.click("orders:0")
+    ui.click("order:AB123")
+    assert "Нужна ручная проверка" in ui.text
+    assert not any("resume" in button.callback_data for button in ui.buttons)
+
+
+def test_manual_resolution_does_not_claim_provider_payment(ui, env):
+    prepare(env)
+    ui.click("orders:0")
+    ui.click("order:AB123")
+    ui.click("resolveask:AB123")
+    ui.click("finish:AB123")
+    assert "Продавец закрыл запись вручную" in ui.text
+    assert not any("redeliver" in button.callback_data for button in ui.buttons)
+    assert not env[3].calls
+    admin(env[0], "/ggp_redeliver AB123")
+    assert not env[3].calls
+
+
+def test_lot_pagination_and_html_escaping(ui, env):
+    lots = env[2].profile.get_sorted_lots.return_value
+    for key in range(124, 135):
+        lot = copy.copy(lots[123])
+        lot.id, lot.description = key, "<b>title</b>"
+        lots[key] = lot
+    ui.click("lots:0")
+    assert sum("lot:" in button.callback_data for button in ui.buttons) == 6
+    ui.click("lots:1")
+    ui.click("lot:129")
+    assert "&lt;b&gt;title&lt;/b&gt;" in ui.text
+
+
+def test_other_cardinal_wizard_takes_over_text_input(ui):
+    ui.click("connect")
+    ui.click("auth")
+    ui.states[(7, 7)] = {"state": "other_plugin"}
+    ui.type("not-a-ggp-login")
+    assert not ui.panel.pending
+    assert not ui.engine.config.snapshot()["username"]
+
+
+def test_balance_button_checks_both_currencies(ui, env):
+    env[3].overrides["check_balance"] = 12.5
+    ui.click("balance")
+    assert "12.5 USD" in ui.text and "20 TON" in ui.text
+    assert "Подключение работает" in ui.text
+
+
+def test_panel_environment_credentials_are_not_overwritten_by_wizard(ui, monkeypatch):
+    monkeypatch.setenv("GGP_USERNAME", "external")
+    ui.click("connect")
+    assert "переменные окружения" in ui.text
+    assert not any(button.callback_data.endswith(":auth") for button in ui.buttons)
